@@ -6,7 +6,7 @@ import argparse
 import logging
 import asyncio
 import struct
-import crcmod
+from amaranth.lib.crc.catalog import CRC8_NRSC_5
 
 from ....support.logging import dump_hex
 from ....support.data_logger import DataLogger
@@ -42,7 +42,7 @@ class SEN5xI2CInterface:
     def _log(self, message, *args):
         self._logger.log(self._level, "SEN5x: " + message, *args)
 
-    _crc = staticmethod(crcmod.mkCrcFun(0x131, initCrc=0xff, rev=False))
+    _crc = staticmethod(CRC8_NRSC_5(data_width=8).compute)
 
     async def _read_raw(self, addr, length=0, delay_seconds=None):
         assert length % 2 == 0
@@ -122,7 +122,7 @@ class SEN5xI2CInterface:
         return SEN5xMeasurement(pm1_0, pm2_5, pm4_0, pm10, rh_pct, temp_degC, voc_index, nox_index)
 
 
-class SensorSEN5xApplet(I2CInitiatorApplet, name="sensor-sen5x"):
+class SensorSEN5xApplet(I2CInitiatorApplet):
     logger = logging.getLogger(__name__)
     help = "measure PM, NOx, VOC, humidity, and temperature with Sensirion SEN5x sensors"
     description = """
