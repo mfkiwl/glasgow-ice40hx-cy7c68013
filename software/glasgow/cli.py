@@ -11,10 +11,6 @@ import unittest
 import importlib.metadata
 from vcd import VCDWriter
 from datetime import datetime
-try:
-    from ast import PyCF_ALLOW_TOP_LEVEL_AWAIT # Python 3.8+
-except ImportError:
-    PyCF_ALLOW_TOP_LEVEL_AWAIT = 0 # Python 3.7-
 
 from fx2 import FX2Config, FX2Device, FX2DeviceError, VID_CYPRESS, PID_FX2
 from fx2.format import input_data, diff_data
@@ -188,6 +184,12 @@ def get_argparser():
 
             if mode == "tool":
                 applet_cls.tool_cls.add_arguments(p_applet)
+
+            if mode in ("repl", "script"):
+                # this will absorb all arguments from the '--' onwards (inclusive), make sure it's
+                # always last... the '--' item that ends up at the front is removed before the list
+                # is passed to the repo / script environment
+                p_applet.add_argument('script_args', nargs=argparse.REMAINDER)
 
     parser = create_argparser()
 
@@ -484,9 +486,6 @@ async def _main():
     args = get_argparser().parse_args()
     create_logger(args)
 
-    if sys.version_info < (3, 8) and os.name == "nt":
-        logger.warn("Ctrl+C on Windows is only supported on Python 3.8+")
-
     device = None
     try:
         if args.action not in ("build", "test", "tool", "factory", "list"):
@@ -621,6 +620,9 @@ async def _main():
                     logger.warn("applet %r is PREVIEW QUALITY and may CORRUPT DATA", args.applet)
                 try:
                     iface = await applet.run(device, args)
+                    if args.action in ("repl", "script"):
+                        if len(args.script_args) > 0 and args.script_args[0] == "--":
+                            args.script_args = args.script_args[1:]
                     if args.action == "run":
                         return await applet.interact(device, args, iface)
                     elif args.action == "repl":
@@ -628,11 +630,11 @@ async def _main():
                     elif args.action == "script":
                         if args.script_file:
                             code = compile(args.script_file.read(), filename=args.script_file.name,
-                                mode="exec", flags=PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                                mode="exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
                         else:
                             code = compile(args.script_cmd, filename="<command>",
-                                mode="exec", flags=PyCF_ALLOW_TOP_LEVEL_AWAIT)
-                        future = eval(code, {"iface":iface, "device":device})
+                                mode="exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                        future = eval(code, {"iface":iface, "device":device, "args":args})
                         if future is not None:
                             await future
 
