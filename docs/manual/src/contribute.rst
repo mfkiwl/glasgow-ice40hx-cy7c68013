@@ -15,9 +15,7 @@ Bug reports are always welcome! If you are experiencing an issue with your devic
 
 For a timely resolution of your issues involving the Glasgow software, include the following information when `reporting a bug on GitHub <issues_>`__:
 
-* Your operating system, including its version (e.g.: "Debian Linux bookworm" or "Windows 10 update 22H2");
-
-* The version of the Glasgow software stack (as printed by ``glasgow --version``);
+* The version of the Glasgow software stack and environment components (as printed by ``glasgow --version``);
 
 * The complete debug information produced by the command you are running (as printed by ``glasgow -vvv [command...]``).
 
@@ -47,19 +45,25 @@ The Glasgow project does not strictly adhere to any specific Python or C coding 
 Writing commit messages
 #######################
 
-When modifying Python code, the first line of a commit message should, if possible, start with the name of the module that is being modified, such that ``git log --grep`` can be used to filter changes by scope. E.g.:
+When modifying Python code, the first line of a commit message should, if possible, start with the name of the module (not including the leading ``glasgow.``) that is being modified, such that ``git log --grep`` can be used to filter changes by scope:
 
 .. code:: text
 
     protocol.jtag_svf: accept and ignore whitespace in scan data.
 
-When modifying documentation, the first line of a commit message should start with ``manual:``, followed by the base name of the ``.rst`` file that is being modified. E.g.:
+The format is the same for Python code implementing applets:
+
+.. code:: text
+
+    applet.interface.uart: make autobaud more reliable.
+
+When modifying documentation, the first line of a commit message should start with ``manual:``, followed by the base name of the ``.rst`` file that is being modified:
 
 .. code:: text
 
     manual: intro: update the list of applets.
 
-When modifying firmware, the first line of a commit message should start with ``firmware:``. E.g.:
+When modifying firmware, the first line of a commit message should start with ``firmware:``:
 
 .. code:: text
 

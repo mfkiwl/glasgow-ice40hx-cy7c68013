@@ -1,6 +1,7 @@
 import os
 import sys
 import ast
+import platform
 import logging
 import argparse
 import textwrap
@@ -18,7 +19,7 @@ from fx2.format import input_data, diff_data
 from . import __version__
 from .support.logging import *
 from .support.asignal import *
-from .support.plugin import PluginRequirementsUnmet
+from .support.plugin import PluginRequirementsUnmet, PluginLoadError
 from .device import GlasgowDeviceError
 from .device.config import GlasgowConfig
 from .target.toolchain import ToolchainNotFound
@@ -71,15 +72,30 @@ class TextHelpFormatter(argparse.HelpFormatter):
         return re.sub(r"((?!\n\n)(?!\n\s+(?:\*|\$|\d+\.)).)+(\n*)?", filler, text, flags=re.S)
 
 
+def version_info():
+    glasgow_version = __version__
+    python_version = '.'.join(map(str, sys.version_info[:3]))
+    python_implementation = platform.python_implementation()
+    python_platform = platform.platform()
+    freedesktop_os_name = ""
+    if hasattr(platform, "freedesktop_os_release"): # TODO(py3.9): present in 3.10+
+        try:
+            freedesktop_os_release = platform.freedesktop_os_release()
+            if "PRETTY_NAME" in freedesktop_os_release:
+                freedesktop_os_name = f" {freedesktop_os_release['PRETTY_NAME']}"
+        except OSError:
+            pass
+    return (
+        f"Glasgow {glasgow_version} "
+        f"({python_implementation} {python_version} on {python_platform}{freedesktop_os_name})"
+    )
+
+
 def create_argparser():
     parser = argparse.ArgumentParser(formatter_class=TextHelpFormatter)
 
-    version = "Glasgow version {version} (Python {python_version})" \
-        .format(python_version=".".join(str(n) for n in sys.version_info[:3]),
-                version=__version__)
-
     parser.add_argument(
-        "-V", "--version", action="version", version=version,
+        "-V", "--version", action="version", version=version_info(),
         help="show version and exit")
     parser.add_argument(
         "-v", "--verbose", default=0, action="count",
@@ -122,7 +138,7 @@ def get_argparser():
         subparsers = add_subparsers(parser, dest="applet", metavar="APPLET", required=required)
 
         for handle, metadata in GlasgowAppletMetadata.all().items():
-            if not metadata.available:
+            if not metadata.loadable:
                 # fantastically cursed
                 p_applet = subparsers.add_parser(
                     handle, help=metadata.synopsis, description=metadata.description,
@@ -133,7 +149,7 @@ def get_argparser():
 
             applet_cls = metadata.applet_cls
 
-            if mode == "test" and not hasattr(applet_cls, "test_cls"):
+            if mode == "test" and applet_cls.tests() is None:
                 continue
             if mode == "tool" and not hasattr(applet_cls, "tool_cls"):
                 continue
@@ -149,7 +165,7 @@ def get_argparser():
                 description = "    This applet is PREVIEW QUALITY and may CORRUPT DATA or " \
                               "have missing features. Use at your own risk.\n" + description
             if applet_cls.required_revision > "A0":
-                help += " (rev{}+)".format(applet_cls.required_revision)
+                help += f" (rev{applet_cls.required_revision}+)"
                 description += "\n    This applet requires Glasgow rev{} or later." \
                                .format(applet_cls.required_revision)
 
@@ -205,7 +221,7 @@ def get_argparser():
         if re.match(r"^[A-C][0-9]-\d{8}T\d{6}Z$", arg):
             return arg
         else:
-            raise argparse.ArgumentTypeError("{} is not a valid serial number".format(arg))
+            raise argparse.ArgumentTypeError(f"{arg} is not a valid serial number")
 
     parser.add_argument(
         "--serial", metavar="SERIAL", type=serial,
@@ -222,7 +238,7 @@ def get_argparser():
     def add_voltage_arg(parser, help):
         parser.add_argument(
             "voltage", metavar="VOLTS", type=float, nargs="?", default=None,
-            help="{} (range: 1.8-5.0)".format(help))
+            help=f"{help} (range: 1.8-5.0)")
 
     p_voltage = subparsers.add_parser(
         "voltage", formatter_class=TextHelpFormatter,
@@ -378,6 +394,11 @@ def get_argparser():
         "--manufacturer", metavar="MFG", dest="factory_manufacturer", type=factory_manufacturer,
         default="", # the default is implemented in the firmware
         help="manufacturer string (if not specified: whitequark research)")
+    p_factory.add_argument(
+        "--using-modified-design-files", dest="factory_modified_design", choices=("yes", "no"),
+        required=True, # must be specified explicitly
+        help="whether the design files used to manufacture the PCBA were modified from the ones "
+             "published in the https://github.com/GlasgowEmbedded/glasgow/ repository")
 
     p_list = subparsers.add_parser(
         "list", formatter_class=TextHelpFormatter,
@@ -424,7 +445,7 @@ class TerminalFormatter(logging.Formatter):
         for color_override in os.getenv("GLASGOW_COLORS", "").split(":"):
             if color_override:
                 level, color = color_override.split("=", 2)
-                self.colors[level] = "\033[{}m".format(color)
+                self.colors[level] = f"\033[{color}m"
 
     def format(self, record):
         color = self.colors.get(record.levelname, "")
@@ -432,7 +453,7 @@ class TerminalFormatter(logging.Formatter):
         record.name = record.name.replace("glasgow.", "g.")
         # applet.memory._25x → applet.memory.25x
         record.name = record.name.replace("._", ".")
-        return "{}{}\033[0m".format(color, super().format(record))
+        return f"{color}{super().format(record)}\033[0m"
 
 
 class SubjectFilter:
@@ -448,7 +469,7 @@ class SubjectFilter:
         return levelno >= self.level
 
 
-def create_logger(args):
+def create_logger():
     root_logger = logging.getLogger()
 
     term_formatter_args = {"style": "{",
@@ -459,6 +480,10 @@ def create_logger(args):
     else:
         term_handler.setFormatter(logging.Formatter(**term_formatter_args))
     root_logger.addHandler(term_handler)
+    return term_handler
+
+def configure_logger(args, term_handler):
+    root_logger = logging.getLogger()
 
     file_formatter_args = {"style": "{",
         "fmt": "[{asctime:s}] {levelname:s}: {name:s}: {message:s}"}
@@ -483,8 +508,12 @@ def create_logger(args):
 
 
 async def _main():
+    # Handle log messages emitted during construction of the argument parser (e.g. by the plugin
+    # subsystem).
+    term_handler = create_logger()
+
     args = get_argparser().parse_args()
-    create_logger(args)
+    configure_logger(args, term_handler)
 
     device = None
     try:
@@ -541,7 +570,7 @@ async def _main():
             plan = target.build_plan()
 
             if args.prebuilt or args.bitstream:
-                bitstream_file = args.bitstream or open("{}.bin".format(args.applet), "rb")
+                bitstream_file = args.bitstream or open(f"{args.applet}.bin", "rb")
                 with bitstream_file:
                     await device.download_prebuilt(plan, bitstream_file)
             else:
@@ -596,7 +625,7 @@ async def _main():
                             next_timestamp += 100 # 1us
                             break
 
-                        event_repr = " ".join("{}={}".format(n, v)
+                        event_repr = " ".join(f"{n}={v}"
                                               for n, v in events.items())
                         target.analyzer.logger.trace("cycle %d: %s", cycle, event_repr)
 
@@ -664,6 +693,10 @@ async def _main():
             for task in pending:
                 task.cancel()
             await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
+
+            # If the applet task has raised an exception, retrieve it here in case any of the await
+            # statements above will fail; if we don't, asyncio will unnecessarily complain.
+            applet_task.exception()
 
             if do_trace:
                 await device.write_register(target.analyzer.addr_done, 1)
@@ -751,7 +784,7 @@ async def _main():
                             fx2_config.append(addr, chunk)
                 else:
                     logger.info("using built-in firmware")
-                    for (addr, chunk) in GlasgowHardwareDevice.firmware():
+                    for (addr, chunk) in GlasgowHardwareDevice.firmware_data():
                         fx2_config.append(addr, chunk)
                 fx2_config.disconnect = True
                 new_image = fx2_config.encode()
@@ -788,7 +821,7 @@ async def _main():
             plan = target.build_plan()
             if args.type in ("il", "rtlil"):
                 logger.info("generating RTLIL for applet %r", args.applet)
-                with open(args.filename or args.applet + ".il", "wt") as f:
+                with open(args.filename or args.applet + ".il", "w") as f:
                     f.write(plan.rtlil)
             if args.type in ("zip", "archive"):
                 logger.info("generating archive for applet %r", args.applet)
@@ -811,11 +844,11 @@ async def _main():
                 result.stream.write("\n")
             result.startTest = startTest
             if args.tests == []:
-                suite = loader.loadTestsFromTestCase(applet.test_cls)
+                suite = loader.loadTestsFromTestCase(applet.tests())
                 suite.run(result)
             else:
                 for test in args.tests:
-                    suite = loader.loadTestsFromName(test, module=applet.test_cls)
+                    suite = loader.loadTestsFromName(test, module=applet.tests())
                     suite.run(result)
             if not result.wasSuccessful():
                 for _, traceback in result.errors + result.failures:
@@ -829,8 +862,9 @@ async def _main():
 
             device_id = GlasgowConfig.encode_revision(args.factory_rev)
             glasgow_config = GlasgowConfig(args.factory_rev, args.factory_serial,
-                                           manufacturer=args.factory_manufacturer)
-            firmware = GlasgowHardwareDevice.firmware()
+                                           manufacturer=args.factory_manufacturer,
+                                           modified_design=(args.factory_modified_design != "no"))
+            firmware_data = GlasgowHardwareDevice.firmware_data()
 
             if args.reinitialize:
                 vid, pid = VID_QIHW, PID_GLASGOW
@@ -848,7 +882,7 @@ async def _main():
             fx2_config = FX2Config(vendor_id=VID_QIHW, product_id=PID_GLASGOW,
                                    device_id=device_id, i2c_400khz=True, disconnect=True)
             fx2_config.append(0x4000 - glasgow_config.size, glasgow_config.encode())
-            for (addr, chunk) in firmware:
+            for (addr, chunk) in firmware_data:
                 fx2_config.append(addr, chunk)
             image = fx2_config.encode()
 
@@ -878,7 +912,7 @@ async def _main():
         return 2
 
     # Environment-related errors
-    except PluginRequirementsUnmet as e:
+    except (PluginRequirementsUnmet, PluginLoadError) as e:
         logger.error(e)
         print(e.metadata.description)
         return 3
