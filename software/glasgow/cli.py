@@ -375,7 +375,7 @@ def get_argparser():
         if len(arg) <= 23:
             return arg
         else:
-            raise argparse.ArgumentTypeError("f{arg} is too long for the manufacturer field")
+            raise argparse.ArgumentTypeError(f"{arg} is too long for the manufacturer field")
 
     p_factory = subparsers.add_parser(
         "factory", formatter_class=TextHelpFormatter,
@@ -418,7 +418,7 @@ def _applet(revision, args):
                    .format(applet.required_revision, revision))
         if revision < applet.required_revision:
             if args.override_required_revision:
-                applet.logger.warn(message)
+                applet.logger.warning(message)
             else:
                 raise GlasgowAppletError(message)
         applet.build(target, args)
@@ -507,7 +507,7 @@ def configure_logger(args, term_handler):
         root_logger.setLevel(level)
 
 
-async def _main():
+async def main():
     # Handle log messages emitted during construction of the argument parser (e.g. by the plugin
     # subsystem).
     term_handler = create_logger()
@@ -646,7 +646,7 @@ async def _main():
             async def run_applet():
                 logger.info("running handler for applet %r", args.applet)
                 if applet.preview:
-                    logger.warn("applet %r is PREVIEW QUALITY and may CORRUPT DATA", args.applet)
+                    logger.warning("applet %r is PREVIEW QUALITY and may CORRUPT DATA", args.applet)
                 try:
                     iface = await applet.run(device, args)
                     if args.action in ("repl", "script"):
@@ -778,7 +778,7 @@ async def _main():
                 new_image[0] = 0xC0
             else:
                 if args.firmware:
-                    logger.warn("using custom firmware from %s", args.firmware.name)
+                    logger.warning("using custom firmware from %s", args.firmware.name)
                     with args.firmware as f:
                         for (addr, chunk) in input_data(f, fmt="ihex"):
                             fx2_config.append(addr, chunk)
@@ -813,6 +813,8 @@ async def _main():
                 if await device.read_eeprom("fx2", 0, len(new_image)) != new_image:
                     logger.critical("configuration/firmware programming failed")
                     return 1
+
+                logger.warn("power cycle the device to apply changes")
             else:
                 logger.info("configuration and firmware identical")
 
@@ -922,7 +924,7 @@ async def _main():
 
     # User interruption
     except KeyboardInterrupt:
-        logger.warn("interrupted")
+        logger.warning("interrupted")
         return 130 # 128 + SIGINT
 
     finally:
@@ -932,10 +934,11 @@ async def _main():
     return 0
 
 
-def main():
-    loop = asyncio.get_event_loop()
-    exit(loop.run_until_complete(_main()))
+# This entry point is invoked via `project.scripts.glasgow` when installing the package with `pipx`.
+def run_main():
+    exit(asyncio.run(main()))
 
 
+# This entry point is invoked when running `python -m glasgow.cli`.
 if __name__ == "__main__":
-    main()
+    run_main()

@@ -1,7 +1,6 @@
 import logging
 from amaranth import *
-from amaranth.hdl.cd import ClockDomain
-from amaranth.hdl.rec import Record
+from amaranth.lib import data
 
 from ....gateware.pads import *
 from ....gateware.pll import *
@@ -57,18 +56,13 @@ class VGAOutputSubtarget(Elaboratable):
 
         m.domains.pix = cd_pix = ClockDomain(reset_less=True)
         m.submodules += PLL(f_in=platform.default_clk_frequency, f_out=self.pix_clk_freq, odomain="pix")
-        platform.add_clock_constraint(cd_pix.clk, self.pix_clk_freq)
 
         h_total = self.h_front + self.h_sync + self.h_back + self.h_active
         v_total = self.v_front + self.v_sync + self.v_back + self.v_active
 
         h_ctr = Signal(range(h_total))
         v_ctr = Signal(range(v_total))
-        pix = Record([
-            ("r", 1),
-            ("g", 1),
-            ("b", 1),
-        ])
+        pix = Signal(data.StructLayout({"r": 1, "g": 1, "b": 1}))
 
         h_en  = Signal()
         v_en  = Signal()
@@ -203,6 +197,9 @@ class VGAOutputApplet(GlasgowApplet):
 
     async def run(self, device, args):
         return await device.demultiplexer.claim_interface(self, self.mux_interface, args)
+
+    async def interact(self, device, args, vga):
+        pass
 
     @classmethod
     def tests(cls):

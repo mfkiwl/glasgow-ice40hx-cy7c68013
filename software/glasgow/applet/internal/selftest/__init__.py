@@ -28,14 +28,14 @@ class SelfTestSubtarget(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        m.d.comb += [pin.oe.eq(pin.io.oe) for pin in self.pins_a if hasattr(pin, "oe")]
+        m.d.comb += [pin.oe.o.eq(pin.io.oe) for pin in self.pins_a if hasattr(pin, "oe")]
         m.d.comb += [
             Cat(pin.io.oe for pin in self.pins_a).eq(self.reg_oe_a),
             Cat(pin.io.o for pin in self.pins_a).eq(self.reg_o_a),
             self.reg_i_a.eq(Cat(pin.io.i for pin in self.pins_a))
         ]
 
-        m.d.comb += [pin.oe.eq(pin.io.oe) for pin in self.pins_b if hasattr(pin, "oe")]
+        m.d.comb += [pin.oe.o.eq(pin.io.oe) for pin in self.pins_b if hasattr(pin, "oe")]
         m.d.comb += [
             Cat(pin.io.oe for pin in self.pins_b).eq(self.reg_oe_b),
             Cat(pin.io.o for pin in self.pins_b).eq(self.reg_o_b),
@@ -101,6 +101,9 @@ class SelfTestApplet(GlasgowApplet):
             help="run self-test mode MODE (default: {})".format(" ".join(cls.__default_modes)))
 
     async def run(self, device, args):
+        return None
+
+    async def interact(self, device, args, iface):
         async def set_oe(bits):
             await device.write_register(self.addr_oe_a, (bits >> 0) & 0xff)
             await device.write_register(self.addr_oe_b, (bits >> 8) & 0xff)
@@ -148,7 +151,7 @@ class SelfTestApplet(GlasgowApplet):
             self.logger.info("running self-test mode %s", mode)
 
             if mode == "leds":
-                self.logger.warn("power cycle the device to restore LED function")
+                self.logger.warning("power cycle the device to restore LED function")
 
                 led_state = 0b11111111111_00000000000
                 while True:

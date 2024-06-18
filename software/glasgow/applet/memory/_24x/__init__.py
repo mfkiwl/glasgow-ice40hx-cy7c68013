@@ -21,9 +21,10 @@ class Memory24xInterface:
         if self._addr_width == 2:
             addr_msb = (addr >> 8) & 0xff
             addr_lsb = (addr >> 0) & 0xff
-            return (self._i2c_addr, [addr_msb, addr_lsb])
+            i2c_addr = self._i2c_addr + (addr >> 16)
+            return (i2c_addr, [addr_msb, addr_lsb])
         else:
-            i2c_addr = self._i2c_addr | (addr >> 8)
+            i2c_addr = self._i2c_addr + (addr >> 8)
             return (i2c_addr, [addr & 0xff])
 
     async def read(self, addr, length):
@@ -89,16 +90,15 @@ class Memory24xApplet(I2CInitiatorApplet):
     Atmel 24C256, or hundreds of other memories that typically have "24X" where X is a letter
     in their part number.
 
-    If one address byte is used and an address higher than 255 is specified, either directly
-    or implicitly through operation size, the high address bits are logically ORed with
-    the I²C address. In this case the pins used on smaller devices for low address bits are
-    internally not connected.
+    If a sequential read or write operation would advance the memory's internal address pointer
+    past 255 (for one address byte memories) or 65536 (for two address byte memories), the carried
+    over bits are instead added to the I²C address.
 
     # Page size
 
     The memory performs writes by first latching incoming data into a page buffer, and committing
     the page buffer after a stop condition. If more data is provided than the page buffer size,
-    or if page boundary is crossed when the address is autoincremneted, a wraparound occurs; this
+    or if page boundary is crossed when the address is autoincremented, a wraparound occurs; this
     generally results in wrong memory contents after the write operation is complete. The purpose
     of having a page buffer is to batch updates, since a write of any length between 1 and page
     size takes the same amount of time.
@@ -218,14 +218,20 @@ class Memory24xApplet(I2CInitiatorApplet):
 
         if args.operation == "verify":
             if args.data is not None:
-                golden_data = args.data
+                gold_data = args.data
             if args.file is not None:
-                golden_data = args.file.read()
+                gold_data = args.file.read()
 
-            actual_data = await m24x_iface.read(args.address, len(golden_data))
-            if actual_data is None:
+            flash_data = await m24x_iface.read(args.address, len(gold_data))
+            if flash_data is None:
                 raise GlasgowAppletError("memory did not acknowledge read")
-            if actual_data == golden_data:
+            if flash_data == gold_data:
                 self.logger.info("verify PASS")
             else:
+                for offset, (gold_byte, flash_byte) in enumerate(zip(gold_data, flash_data)):
+                    if gold_byte != flash_byte:
+                        different_at = args.address + offset
+                        break
+                self.logger.error("first differing byte at %#08x (expected %#04x, actual %#04x)",
+                                  different_at, gold_byte, flash_byte)
                 raise GlasgowAppletError("verify FAIL")

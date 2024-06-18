@@ -53,26 +53,24 @@ To check that all of the external links in the documentation are valid, run the 
     (        purchase: line    9) ok        https://1bitsquared.com/products/glasgow
     (       community: line   10) ok        https://1bitsquared.com/pages/chat
     (           intro: line   69) ok        https://asciinema.org/a/245309
-    (           intro: line   69) ok        https://asciinema.org/a/i9edqaUBVLLw7mRZCpdxe91Fu.svg
-    (         install: line  106) ok        https://brew.sh/
     [... continued]
 
-At the moment, some of the URLs fail despite being valid, so this command is not included in a continuous integration check.
+Our continuous integration system checks external links on every build, ensuring they stay valid.
 
 .. _GlasgowEmbedded/glasgow: https://github.com/GlasgowEmbedded/glasgow
 .. _reStructuredText: https://www.sphinx-doc.org/en/master/usage/restructuredtext/basics.html
 .. _Sphinx: https://www.sphinx-doc.org/en/master/index.html
-.. _PDM: https://pdm.fming.dev/latest/
-.. _install PDM: https://pdm.fming.dev/latest/#installation
+.. _PDM: https://pdm-project.org/latest/
+.. _install PDM: https://pdm-project.org/latest/#installation
 
 
 Style guide
 -----------
 
-When writing documentation, please try to follow our style:
+When writing documentation, please follow our style:
 
-* Only capitalise the first word of headings
-* Insert two blank lines before headings
-* Use ``.. note::`` and ``.. warning::`` sparingly, but where important details may otherwise be missed
-* Use an em-dash (---), which can be written as ``---`` in restructured text
-* Link to our official `GlasgowEmbedded <https://github.com/GlasgowEmbedded>`_ repositories where appropriate
+* Only capitalise the first word of headings.
+* Insert two blank lines before headings.
+* Use ``.. note::`` and ``.. warning::`` sparingly, where important details may otherwise be missed.
+* Use an em-dash (---), which can be written as ``---`` in reStructuredText.
+* Link to our `official repositories <https://github.com/GlasgowEmbedded>`_ where appropriate.

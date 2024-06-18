@@ -1,11 +1,12 @@
-import os
+import os, time
 is_production = True if os.getenv("DOCS_IS_PRODUCTION", "").lower() in ('1', 'yes', 'true') else False
 
 html_title = project = "Glasgow Interface\u00a0Explorer"
 release = version = ""
-copyright = "2020—2023, Glasgow Interface Explorer contributors"
+copyright = time.strftime("2020—%Y, Glasgow Interface Explorer contributors")
 
 extensions = [
+    "myst_parser",
     "sphinx.ext.todo",
     "sphinx.ext.intersphinx",
     "sphinx_copybutton",
@@ -56,8 +57,8 @@ if is_production:
             "color-announcement-text": "#64cc69",
         },
         "announcement":
-            "The Early Bird units are being shipped by Mouser! "
-            "<a href='https://crowdsupply.com/1bitsquared/glasgow'>Pre-Order yours now</a>"
+            "Production units are being shipped by Mouser. "
+            "<a href='https://crowdsupply.com/1bitsquared/glasgow'>Pre-order yours now!</a>"
     })
 else:
     html_theme_options.update({
@@ -73,3 +74,16 @@ else:
             "This documentation page has been built as a preview. It may be outdated or incorrect "
             "compared to <a href='https://glasgow-embedded.org/'>the official version</a>."
     })
+
+linkcheck_ignore = [
+    r"^http://127\.0\.0\.1:8000$",
+    # Doesn't like the linkcheck User-Agent.
+    r"^https://mouser\.com/",
+]
+
+linkcheck_anchors_ignore_for_url = [
+    r"^https://matrix\.to/",
+    r"^https://web\.libera\.chat/",
+    # React page with README content included as a JSON payload.
+    r"^https://github\.com/[^/]+/[^/]+/$",
+]

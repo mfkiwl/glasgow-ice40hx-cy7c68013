@@ -1,13 +1,13 @@
-import hashlib
 import os
 import sys
 import tempfile
 import shutil
 import logging
 import hashlib
-import platformdirs
 import pathlib
+import platformdirs
 from amaranth import *
+from amaranth.lib import io
 from amaranth.build import ResourceError
 
 from ..gateware.i2c import I2CTarget
@@ -39,22 +39,23 @@ class GlasgowHardwareTarget(Elaboratable):
             raise ValueError("Unknown revision")
 
         try:
-            self.platform.request("unused")
+            self.platform.request("unused", dir="-")
         except ResourceError:
             pass
 
         self._submodules = []
 
-        self.i2c_target = I2CTarget(self.platform.request("i2c"))
+        self.i2c_target = I2CTarget(self.platform.request("i2c", dir={"scl": "-", "sda": "-"}))
         self.registers = I2CRegisters(self.i2c_target)
 
-        self.fx2_crossbar = FX2Crossbar(self.platform.request("fx2", xdr={
-            "sloe": 1, "slrd": 1, "slwr": 1, "pktend": 1, "fifoadr": 1, "flag": 2, "fd": 2
+        self.fx2_crossbar = FX2Crossbar(self.platform.request("fx2", dir={
+            "sloe": "-", "slrd": "-", "slwr": "-", "pktend": "-", "fifoadr": "-",
+            "flag": "-", "fd": "-"
         }))
 
         self.ports = {
-            "A": (8, lambda n: self.platform.request("port_a", n)),
-            "B": (8, lambda n: self.platform.request("port_b", n)),
+            "A": (8, lambda n: self.platform.request("port_a", n, dir={"io": "-", "oe": "-"})),
+            "B": (8, lambda n: self.platform.request("port_b", n, dir={"io": "-", "oe": "-"})),
         }
 
         if multiplexer_cls:
@@ -93,7 +94,7 @@ class GlasgowHardwareTarget(Elaboratable):
                     pass
         for unused_pin in unused_pins:
             if hasattr(unused_pin, "oe"):
-                m.d.comb += unused_pin.oe.o.eq(0)
+                m.submodules += io.Buffer("o", unused_pin.oe)
 
         return m
 
@@ -139,7 +140,8 @@ class GlasgowBuildPlan:
             environ = self.toolchain.env_vars
             if os.name == 'nt':
                 # PROCESSOR_ARCHITECTURE: required for YoWASP (used by wasmtime)
-                for var in ("PROCESSOR_ARCHITECTURE",):
+                # SYSTEMROOT: required for child Python processes to initialize properly
+                for var in ("PROCESSOR_ARCHITECTURE", "SYSTEMROOT"):
                     environ[var] = os.environ[var]
             products  = self.lower.execute_local(build_dir, env=environ)
             bitstream = products.get("top.bin")

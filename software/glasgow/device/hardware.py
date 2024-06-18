@@ -10,7 +10,7 @@ from fx2 import REQ_RAM, REG_CPUCS
 from fx2.format import input_data
 
 from ..support.logging import *
-from . import GlasgowDeviceError
+from . import GlasgowDeviceError, quirks
 from .config import GlasgowConfig
 
 
@@ -96,7 +96,7 @@ class GlasgowHardwareDevice:
             usb_context.hotplugRegisterCallback(hotplug_callback,
                 flags=usb1.HOTPLUG_ENUMERATE)
         else:
-            devices.extend(list(usb_context.getDeviceIterator()))
+            devices.extend(list(usb_context.getDeviceIterator(skip_on_error=True)))
 
         while any(devices):
             device = devices.pop()
@@ -131,8 +131,8 @@ class GlasgowHardwareDevice:
                     # the more likely it is to eventually cause misery.
                     serial = handle.getASCIIStringDescriptor(
                         device.getSerialNumberDescriptor())
-                    logger.warn(f"please run `glasgow flash` to update firmware of device "
-                                f"{serial}")
+                    logger.warning(f"please run `glasgow flash` to update firmware of device "
+                                   f"{serial}")
                 except usb1.USBErrorBusy:
                     logger.debug("found busy rev%s device with unsupported API level %d",
                                  revision, api_level)
@@ -174,8 +174,8 @@ class GlasgowHardwareDevice:
                         # Found it!
                         break
                 else:
-                    logger.warn("device %03d/%03d did not re-enumerate after firmware upload",
-                                device.getBusNumber(), device.getDeviceAddress())
+                    logger.warning("device %03d/%03d did not re-enumerate after firmware upload",
+                                   device.getBusNumber(), device.getDeviceAddress())
 
             else:
                 # No hotplug capability (most likely because we're running on Windows); give
@@ -185,7 +185,7 @@ class GlasgowHardwareDevice:
                 logger.debug("waiting for re-enumeration")
                 time.sleep(5.0)
 
-                devices.extend(list(usb_context.getDeviceIterator()))
+                devices.extend(list(usb_context.getDeviceIterator(skip_on_error=True)))
 
         return devices_by_serial
 
@@ -221,12 +221,17 @@ class GlasgowHardwareDevice:
             self.usb_handle.setAutoDetachKernelDriver(True)
         except usb1.USBErrorNotSupported:
             pass
-        device_serial = self.usb_handle.getASCIIStringDescriptor(
-            usb_device.getSerialNumberDescriptor())
+        device_manufacturer = self.usb_handle.getASCIIStringDescriptor(
+            usb_device.getManufacturerDescriptor())
         device_product = self.usb_handle.getASCIIStringDescriptor(
             usb_device.getProductDescriptor())
+        device_serial = self.usb_handle.getASCIIStringDescriptor(
+            usb_device.getSerialNumberDescriptor())
         self._serial = device_serial
         self._modified_design = not device_product.startswith("Glasgow Interface Explorer")
+        if (device_manufacturer == "1BitSquared" and
+                device_serial in quirks.modified_design_1b2_mar2024):
+            self._modified_design = False # see quirks.py
         if self._modified_design:
             logger.info("device with serial number %s was manufactured from modified design files",
                         self._serial)
@@ -476,13 +481,13 @@ class GlasgowHardwareDevice:
         bitstream_file_id = bitstream_file.read(16)
         force_download = (bitstream_file_id == b'\xff' * 16)
         if force_download:
-            logger.warn("prebuilt bitstream ID is all ones, forcing download")
+            logger.warning("prebuilt bitstream ID is all ones, forcing download")
         elif await self.bitstream_id() == plan.bitstream_id:
             logger.info("device already has bitstream ID %s", plan.bitstream_id.hex())
             return
         elif bitstream_file_id != plan.bitstream_id:
-            logger.warn("prebuilt bitstream ID %s does not match design bitstream ID %s",
-                        bitstream_file_id.hex(), plan.bitstream_id.hex())
+            logger.warning("prebuilt bitstream ID %s does not match design bitstream ID %s",
+                           bitstream_file_id.hex(), plan.bitstream_id.hex())
         logger.info("downloading prebuilt bitstream ID %s from file %r",
                     plan.bitstream_id.hex(), bitstream_file.name)
         await self.download_bitstream(bitstream_file.read(), plan.bitstream_id)

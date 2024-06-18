@@ -136,7 +136,7 @@ class UARTApplet(GlasgowApplet):
     description = """
     Transmit and receive data via UART.
 
-    Any baud rate is supported. Only 8 start bits and 1 stop bits are supported, with configurable
+    Any baud rate is supported. Only 8 data bits and 1 stop bits are supported, with configurable
     parity.
 
     The automatic baud rate determination algorithm works by locking onto the shortest bit time in
@@ -185,11 +185,13 @@ class UARTApplet(GlasgowApplet):
         self.__sys_clk_freq = target.sys_clk_freq
 
         manual_cyc, self.__addr_manual_cyc = target.registers.add_rw(32)
-        auto_cyc,   self.__addr_auto_cyc   = target.registers.add_ro(32, reset=~0)
+        auto_cyc,   self.__addr_auto_cyc   = target.registers.add_ro(32, init=~0)
         use_auto,   self.__addr_use_auto   = target.registers.add_rw(1)
 
         bit_cyc,    self.__addr_bit_cyc    = target.registers.add_ro(32)
         rx_errors,  self.__addr_rx_errors  = target.registers.add_ro(16)
+
+        self.__has_parity = (args.parity != "none")
 
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
         subtarget = iface.add_subtarget(UARTSubtarget(
@@ -272,7 +274,10 @@ class UARTApplet(GlasgowApplet):
                 delta += 1 << 16
             cur_errors = new_errors
             if delta > 0:
-                self.logger.warning("%d frame or parity errors detected", delta)
+                if self.__has_parity:
+                    self.logger.warning("%d frame or parity errors detected", delta)
+                else:
+                    self.logger.warning("%d frame errors detected", delta)
 
             new_bit_cyc = await device.read_register(self.__addr_bit_cyc, width=4)
             if new_bit_cyc != cur_bit_cyc:

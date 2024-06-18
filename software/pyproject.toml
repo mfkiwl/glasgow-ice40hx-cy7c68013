@@ -32,13 +32,13 @@ dependencies = [
   # `typing_extensions` provides shims for such features. It uses SemVer.
   "typing_extensions>=4.8,<5",
   # Amaranth is the core of the Glasgow software/gateware interoperability layer. It uses SemVer.
-  "amaranth>=0.4.0,<0.5",
+  "amaranth>=0.5.0,<0.6",
   # `packaging` is used in the plugin system, `support.plugin`. It uses CalVer: the major version
   # is the two last digits of the year and the minor version is the release within that year.
   "packaging>=23.0",
   # `platformdirs` is used in the bitstream builder to use platform-appropriate cache directories.
   # It uses SemVer.
-  "platformdirs>=3.0.0,<4",
+  "platformdirs>=3.0.0,<5",
   # `fx2` is effectively maintained together with Glasgow. It uses SemVer, and keeps backward
   # compatibility within the 0.x release series.
   "fx2>=0.11,<1",
@@ -73,7 +73,7 @@ http = [
 ]
 
 [project.scripts]
-glasgow = "glasgow.cli:main"
+glasgow = "glasgow.cli:run_main"
 
 [project.entry-points."glasgow.applet"]
 selftest = "glasgow.applet.internal.selftest:SelfTestApplet"
@@ -82,6 +82,7 @@ benchmark = "glasgow.applet.internal.benchmark:BenchmarkApplet"
 analyzer = "glasgow.applet.interface.analyzer:AnalyzerApplet"
 uart = "glasgow.applet.interface.uart:UARTApplet"
 spi-controller = "glasgow.applet.interface.spi_controller:SPIControllerApplet"
+spi-flashrom = "glasgow.applet.interface.spi_flashrom:SPIFlashromApplet"
 i2c-initiator = "glasgow.applet.interface.i2c_initiator:I2CInitiatorApplet"
 i2c-target = "glasgow.applet.interface.i2c_target:I2CTargetApplet"
 jtag-pinout = "glasgow.applet.interface.jtag_pinout:JTAGPinoutApplet"
@@ -90,6 +91,7 @@ jtag-openocd = "glasgow.applet.interface.jtag_openocd:JTAGOpenOCDApplet"
 jtag-svf = "glasgow.applet.interface.jtag_svf:JTAGSVFApplet"
 ps2-host = "glasgow.applet.interface.ps2_host:PS2HostApplet"
 sbw-probe = "glasgow.applet.interface.sbw_probe:SpyBiWireProbeApplet"
+swd-openocd = "glasgow.applet.interface.swd_openocd:SWDOpenOCDApplet"
 
 memory-24x = "glasgow.applet.memory._24x:Memory24xApplet"
 memory-25x = "glasgow.applet.memory._25x:Memory25xApplet"
@@ -111,6 +113,7 @@ program-stusb4500-nvm = "glasgow.applet.program.stusb4500_nvm:StUsb4500NvmApplet
 program-xc6s = "glasgow.applet.program.xc6s:ProgramXC6SApplet"
 program-xc9500 = "glasgow.applet.program.xc9500:ProgramXC9500Applet"
 program-xc9500xl = "glasgow.applet.program.xc9500xl:ProgramXC9500XLApplet"
+program-xpla3 = "glasgow.applet.program.xpla3:ProgramXPLA3Applet"
 
 control-servo = "glasgow.applet.control.servo:ControlServoApplet"
 control-tps6598x = "glasgow.applet.control.tps6598x:ControlTPS6598xApplet"
@@ -138,8 +141,8 @@ radio-nrf24l01 = "glasgow.applet.radio.nrf24l01:RadioNRF24L01Applet"
 
 [project.urls]
 "Documentation" = "https://glasgow-embedded.org/"
-"Source Code" = "https://github.com/GlasgowEmebedded/Glasgow"
-"Bug Tracker" = "https://github.com/GlasgowEmebedded/Glasgow/issues"
+"Source Code" = "https://github.com/GlasgowEmbedded/glasgow"
+"Bug Tracker" = "https://github.com/GlasgowEmbedded/glasgow/issues"
 
 # Build system configuration
 
