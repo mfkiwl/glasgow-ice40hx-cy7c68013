@@ -1,18 +1,20 @@
+import re
 import os
 import sys
 import ast
-import platform
 import logging
-import argparse
-import textwrap
-import re
+import contextlib
 import asyncio
 import signal
+import argparse
+import textwrap
+import platform
 import unittest
 import importlib.metadata
-from vcd import VCDWriter
 from datetime import datetime
 
+from vcd import VCDWriter
+from amaranth import UnusedElaboratable
 from fx2 import FX2Config, FX2Device, FX2DeviceError, VID_CYPRESS, PID_FX2
 from fx2.format import input_data, diff_data
 
@@ -20,14 +22,13 @@ from . import __version__
 from .support.logging import *
 from .support.asignal import *
 from .support.plugin import PluginRequirementsUnmet, PluginLoadError
-from .device import GlasgowDeviceError
-from .device.config import GlasgowConfig
-from .target.toolchain import ToolchainNotFound
-from .target.hardware import GlasgowHardwareTarget
-from .gateware import GatewareBuildError
-from .gateware.analyzer import TraceDecoder
-from .device.hardware import VID_QIHW, PID_GLASGOW, GlasgowHardwareDevice
-from .access.direct import *
+from .hardware.device import GlasgowDeviceError, GlasgowDevice, GlasgowDeviceConfig
+from .hardware.device import VID_QIHW, PID_GLASGOW
+from .hardware.toolchain import ToolchainNotFound
+from .hardware.build_plan import GatewareBuildError
+from .hardware.assembly import HardwareAssembly
+from .legacy import DeprecatedTarget, DeprecatedMultiplexer
+from .legacy import DeprecatedDevice, DeprecatedDemultiplexer
 from .applet import *
 
 
@@ -69,22 +70,22 @@ class TextHelpFormatter(argparse.HelpFormatter):
             return text
 
         text = textwrap.dedent(text).strip()
+        text = text.replace("::\n\n", "::\n")
         return re.sub(r"((?!\n\n)(?!\n\s+(?:\*|\$|\d+\.)).)+(\n*)?", filler, text, flags=re.S)
 
 
 def version_info():
     glasgow_version = __version__
-    python_version = '.'.join(map(str, sys.version_info[:3]))
+    python_version = ".".join(map(str, sys.version_info[:3]))
     python_implementation = platform.python_implementation()
     python_platform = platform.platform()
     freedesktop_os_name = ""
-    if hasattr(platform, "freedesktop_os_release"): # TODO(py3.9): present in 3.10+
-        try:
-            freedesktop_os_release = platform.freedesktop_os_release()
-            if "PRETTY_NAME" in freedesktop_os_release:
-                freedesktop_os_name = f" {freedesktop_os_release['PRETTY_NAME']}"
-        except OSError:
-            pass
+    try:
+        freedesktop_os_release = platform.freedesktop_os_release()
+        if "PRETTY_NAME" in freedesktop_os_release:
+            freedesktop_os_name = f" {freedesktop_os_release['PRETTY_NAME']}"
+    except OSError:
+        pass
     return (
         f"Glasgow {glasgow_version} "
         f"({python_implementation} {python_version} on {python_platform}{freedesktop_os_name})"
@@ -92,7 +93,7 @@ def version_info():
 
 
 def create_argparser():
-    parser = argparse.ArgumentParser(formatter_class=TextHelpFormatter)
+    parser = argparse.ArgumentParser(formatter_class=TextHelpFormatter, fromfile_prefix_chars="@")
 
     parser.add_argument(
         "-V", "--version", action="version", version=version_info(),
@@ -108,7 +109,10 @@ def create_argparser():
         help="save log messages at highest verbosity to FILE")
     parser.add_argument(
         "-F", "--filter-log", metavar="FILTER", type=str, action="append",
-        help="raise TRACE log messages to DEBUG if they begin with 'FILTER: '")
+        help="raise TRACE log messages to INFO if they begin with 'FILTER: '")
+    parser.add_argument(
+        "--no-shorten", default=False, action="store_true",
+        help="do not shorten sequences in logs")
     parser.add_argument(
         "--statistics", dest="show_statistics", default=False, action="store_true",
         help="display performance counters before exiting")
@@ -117,6 +121,37 @@ def create_argparser():
 
 
 def get_argparser():
+    class LazyParser(argparse.ArgumentParser):
+        """This is a lazy ArgumentParser that runs any added build_func(s) just before arguments
+        are parsed"""
+        def __init__(self, *args, **kwargs):
+            self.build_funcs = []
+            super().__init__(*args, **kwargs)
+
+        def add_build_func(self, build_func):
+            self.build_funcs.append(build_func)
+
+        def build(self):
+            for build_func in self.build_funcs:
+                build_func()
+            self.build_funcs.clear()
+
+        def parse_args(self, args=None, namespace=None):
+            self.build()
+            return super().parse_args(args, namespace)
+
+        def parse_known_args(self, args=None, namespace=None):
+            self.build()
+            return super().parse_known_args(args, namespace)
+
+        def parse_intermixed_args(self, args=None, namespace=None):
+            self.build()
+            return super().parse_intermixed_args(args, namespace)
+
+        def parse_known_intermixed_args(self, args=None, namespace=None):
+            self.build()
+            return super().parse_known_intermixed_args(args, namespace)
+
     def add_subparsers(parser, **kwargs):
         if isinstance(parser, argparse._MutuallyExclusiveGroup):
             container = parser._container
@@ -126,40 +161,39 @@ def get_argparser():
                 kwargs['prog'] = formatter.format_help().strip()
 
             parsers_class = parser._pop_action_class(kwargs, 'parsers')
-            subparsers = argparse._SubParsersAction(option_strings=[],
-                                                    parser_class=type(container),
-                                                    **kwargs)
+            kwargs["parser_class"] = type(container)
+            subparsers = argparse._SubParsersAction(option_strings=[], **kwargs)
             parser._add_action(subparsers)
         else:
             subparsers = parser.add_subparsers(**kwargs)
         return subparsers
 
-    def add_applet_arg(parser, mode, required=False):
-        subparsers = add_subparsers(parser, dest="applet", metavar="APPLET", required=required)
+    def add_stub_parser(subparsers, handle, metadata):
+        # fantastically cursed
+        p_stub = subparsers.add_parser(
+            handle, help=metadata.synopsis, description=metadata.description,
+            formatter_class=TextHelpFormatter, prefix_chars='\0', add_help=False)
+        p_stub.add_argument("args", nargs="...", help=argparse.SUPPRESS)
+        p_stub.add_argument("help", nargs="?", default=p_stub.format_help())
+
+    def add_applet_arg(parser, mode, *, required=False):
+        subparsers = add_subparsers(
+            parser, dest="applet", metavar="APPLET", required=required, parser_class=LazyParser)
 
         for handle, metadata in GlasgowAppletMetadata.all().items():
             if not metadata.loadable:
-                # fantastically cursed
-                p_applet = subparsers.add_parser(
-                    handle, help=metadata.synopsis, description=metadata.description,
-                    formatter_class=TextHelpFormatter, prefix_chars='\0', add_help=False)
-                p_applet.add_argument("args", nargs="...", help=argparse.SUPPRESS)
-                p_applet.add_argument("help", nargs="?", default=p_applet.format_help())
+                add_stub_parser(subparsers, handle, metadata)
+                continue
+            applet_cls = metadata.load()
+
+            # Don't do `.tests() is None`, as this has the overhead of importing the tests module
+            # (about 5ms per applet, which adds up). Instead, check if the function was overridden,
+            # as it's pointless to override it just to return `None`.
+            if mode == "test" and applet_cls.tests is GlasgowApplet.tests:
                 continue
 
-            applet_cls = metadata.applet_cls
-
-            if mode == "test" and applet_cls.tests() is None:
-                continue
-            if mode == "tool" and not hasattr(applet_cls, "tool_cls"):
-                continue
-
-            if mode == "tool":
-                help        = applet_cls.tool_cls.help
-                description = applet_cls.tool_cls.description
-            else:
-                help        = applet_cls.help
-                description = applet_cls.description
+            help        = applet_cls.help
+            description = applet_cls.description
             if applet_cls.preview:
                 help += " (PREVIEW QUALITY APPLET)"
                 description = "    This applet is PREVIEW QUALITY and may CORRUPT DATA or " \
@@ -173,39 +207,65 @@ def get_argparser():
                 handle, help=help, description=description,
                 formatter_class=TextHelpFormatter)
 
-            if mode == "test":
-                p_applet.add_argument(
-                    "tests", metavar="TEST", nargs="*",
-                    help="test cases to run")
+            def p_applet_build_factory(p_applet, handle, applet_cls, mode):
+                # factory function for proper closure
+                def p_applet_build():
+                    if mode == "test":
+                        p_applet.add_argument(
+                            "tests", metavar="TEST", nargs="*",
+                            help="test cases to run")
 
-            if mode in ("build", "interact", "repl", "script"):
-                access_args = DirectArguments(applet_name=handle,
-                                              default_port="AB",
-                                              pin_count=16)
-                if mode in ("interact", "repl", "script"):
-                    g_applet_build = p_applet.add_argument_group("build arguments")
-                    applet_cls.add_build_arguments(g_applet_build, access_args)
-                    g_applet_run = p_applet.add_argument_group("run arguments")
-                    applet_cls.add_run_arguments(g_applet_run, access_args)
-                    if mode == "interact":
-                        # FIXME: this makes it impossible to add subparsers in applets
-                        # g_applet_interact = p_applet.add_argument_group("interact arguments")
-                        # applet.add_interact_arguments(g_applet_interact)
-                        applet_cls.add_interact_arguments(p_applet)
-                    if mode == "repl":
-                        # FIXME: same as above
-                        applet_cls.add_repl_arguments(p_applet)
-                if mode == "build":
-                    applet_cls.add_build_arguments(p_applet, access_args)
+                    if mode in ("build", "interact", "repl", "script"):
+                        access_args = GlasgowAppletArguments(applet_name=handle)
+                        if mode in ("interact", "repl", "script"):
+                            g_applet_build = p_applet.add_argument_group("build arguments")
+                            applet_cls.add_build_arguments(g_applet_build, access_args)
+                            if issubclass(applet_cls, GlasgowAppletV2):
+                                g_applet_setup = p_applet.add_argument_group("setup arguments")
+                                applet_cls.add_setup_arguments(g_applet_setup)
+                                if mode == "interact":
+                                    applet_cls.add_run_arguments(p_applet)
+                            else:
+                                g_applet_run = p_applet.add_argument_group("run arguments")
+                                applet_cls.add_run_arguments(g_applet_run, access_args)
+                                if mode == "interact":
+                                    applet_cls.add_interact_arguments(p_applet)
+                            if mode == "repl":
+                                # FIXME: same as above
+                                applet_cls.add_repl_arguments(p_applet)
+                        if mode == "build":
+                            applet_cls.add_build_arguments(p_applet, access_args)
 
-            if mode == "tool":
-                applet_cls.tool_cls.add_arguments(p_applet)
+                    if mode == "tool":
+                        applet_cls.tool_cls.add_arguments(p_applet)
 
-            if mode in ("repl", "script"):
-                # this will absorb all arguments from the '--' onwards (inclusive), make sure it's
-                # always last... the '--' item that ends up at the front is removed before the list
-                # is passed to the repo / script environment
-                p_applet.add_argument('script_args', nargs=argparse.REMAINDER)
+                    if mode in ("repl", "script"):
+                        # this will absorb all arguments from the '--' onwards (inclusive), make sure it's
+                        # always last... the '--' item that ends up at the front is removed before the list
+                        # is passed to the repo / script environment
+                        p_applet.add_argument('script_args', nargs=argparse.REMAINDER)
+                return p_applet_build
+            p_applet.add_build_func(p_applet_build_factory(p_applet, handle, applet_cls, mode))
+
+    def add_applet_tool_arg(parser, *, required=False):
+        subparsers = add_subparsers(
+            parser, dest="tool", metavar="TOOL", required=required, parser_class=LazyParser)
+
+        def p_tool_build_factory(p_tool, tool_cls):
+            def p_tool_build():
+                tool_cls.add_arguments(p_tool)
+            return p_tool_build
+
+        for handle, metadata in GlasgowAppletToolMetadata.all().items():
+            if not metadata.loadable:
+                add_stub_parser(subparsers, handle, metadata)
+                continue
+
+            tool_cls = metadata.load()
+            p_tool = subparsers.add_parser(
+                handle, help=tool_cls.help, description=tool_cls.description,
+                formatter_class=TextHelpFormatter)
+            p_tool.add_build_func(p_tool_build_factory(p_tool, tool_cls))
 
     parser = create_argparser()
 
@@ -227,7 +287,7 @@ def get_argparser():
         "--serial", metavar="SERIAL", type=serial,
         help="use device with serial number SERIAL")
 
-    subparsers = parser.add_subparsers(dest="action", metavar="COMMAND")
+    subparsers = parser.add_subparsers(dest="action", metavar="COMMAND", parser_class=LazyParser)
     subparsers.required = True
 
     def add_ports_arg(parser):
@@ -250,8 +310,8 @@ def get_argparser():
         "--tolerance", metavar="PCT", type=float, default=10.0,
         help="raise alert if measured voltage deviates by more than ±PCT%% (default: %(default)s)")
     p_voltage.add_argument(
-        "--no-alert", dest="set_alert", default=True, action="store_false",
-        help="do not raise an alert if Vsense is out of range of Vio")
+        "--alert", dest="set_alert", default=False, action="store_true",
+        help="raise an alert if Vsense is out of range of Vio")
 
     p_safe = subparsers.add_parser(
         "safe", formatter_class=TextHelpFormatter,
@@ -264,14 +324,7 @@ def get_argparser():
     add_voltage_arg(p_voltage_limit,
         help="maximum allowed I/O port voltage")
 
-    def add_build_args(parser):
-        parser.add_argument(
-            "--override-required-revision", default=False, action="store_true",
-            help="(advanced) override applet revision requirement")
-
     def add_run_args(parser):
-        add_build_args(parser)
-
         g_run_bitstream = parser.add_mutually_exclusive_group()
         g_run_bitstream.add_argument(
             "--reload", default=False, action="store_true",
@@ -280,25 +333,21 @@ def get_argparser():
             "--prebuilt", default=False, action="store_true",
             help="(advanced) load prebuilt applet bitstream from ./<applet-name.bin>")
         g_run_bitstream.add_argument(
-            "--prebuilt-at", dest="bitstream", metavar="BITSTREAM-FILE",
+            "--prebuilt-at", dest="prebuilt_at", metavar="BITSTREAM-FILE",
             type=argparse.FileType("rb"),
             help="(advanced) load prebuilt applet bitstream from BITSTREAM-FILE")
-
-        parser.add_argument(
-            "--trace", metavar="VCD-FILE", type=argparse.FileType("wt"),
-            help="trace applet I/O to VCD-FILE")
 
     p_run = subparsers.add_parser(
         "run", formatter_class=TextHelpFormatter,
         help="run an applet and interact through its command-line interface")
     add_run_args(p_run)
-    add_applet_arg(p_run, mode="interact", required=True)
+    p_run.add_build_func(lambda: add_applet_arg(p_run, mode="interact", required=True))
 
     p_repl = subparsers.add_parser(
         "repl", formatter_class=TextHelpFormatter,
         help="run an applet and open a REPL to use its programming interface")
     add_run_args(p_repl)
-    add_applet_arg(p_repl, mode="repl", required=True)
+    p_repl.add_build_func(lambda: add_applet_arg(p_repl, mode="repl", required=True))
 
     p_script = subparsers.add_parser(
         "script", formatter_class=TextHelpFormatter,
@@ -311,17 +360,23 @@ def get_argparser():
         "-c", metavar="COMMAND", dest="script_cmd", type=str,
         help="run Python statement COMMAND in the applet context")
     add_run_args(p_script)
-    add_applet_arg(p_script, mode="script", required=True)
+    p_script.add_build_func(lambda: add_applet_arg(p_script, mode="script", required=True))
+
+    p_multi = subparsers.add_parser(
+        "multi", formatter_class=TextHelpFormatter,
+        help="(experimental) run multiple applets simultaneously")
+    p_multi.add_argument(
+        "rest", metavar="ARGS", nargs=argparse.REMAINDER,
+        help="applet name and arguments for each applet, separated by ++ arguments")
 
     p_tool = subparsers.add_parser(
         "tool", formatter_class=TextHelpFormatter,
         help="run an offline tool provided with an applet")
-    add_applet_arg(p_tool, mode="tool", required=True)
+    p_tool.add_build_func(lambda: add_applet_tool_arg(p_tool, required=True))
 
     p_flash = subparsers.add_parser(
         "flash", formatter_class=TextHelpFormatter,
         help="program FX2 firmware or applet bitstream into EEPROM")
-    add_build_args(p_flash)
 
     g_flash_firmware = p_flash.add_mutually_exclusive_group()
     g_flash_firmware.add_argument(
@@ -338,19 +393,14 @@ def get_argparser():
     g_flash_bitstream.add_argument(
         "--remove-bitstream", default=False, action="store_true",
         help="remove any bitstream present")
-    add_applet_arg(g_flash_bitstream, mode="build")
+    p_flash.add_build_func(lambda: add_applet_arg(g_flash_bitstream, mode="build"))
 
     p_build = subparsers.add_parser(
         "build", formatter_class=TextHelpFormatter,
         help="(advanced) build applet logic and save it as a file")
-    add_build_args(p_build)
-
     p_build.add_argument(
         "--rev", metavar="REVISION", type=revision, required=True,
         help="board revision")
-    p_build.add_argument(
-        "--trace", default=False, action="store_true",
-        help="include applet analyzer")
     p_build.add_argument(
         "-t", "--type", metavar="TYPE", type=str,
         choices=["zip", "archive", "il", "rtlil", "bin", "bitstream"], default="bitstream",
@@ -358,12 +408,12 @@ def get_argparser():
     p_build.add_argument(
         "-f", "--filename", metavar="FILENAME", type=str,
         help="file to save artifact to (default: <applet-name>.{zip,il,bin})")
-    add_applet_arg(p_build, mode="build", required=True)
+    p_build.add_build_func(lambda: add_applet_arg(p_build, mode="build", required=True))
 
     p_test = subparsers.add_parser(
         "test", formatter_class=TextHelpFormatter,
         help="(advanced) test applet logic without target hardware")
-    add_applet_arg(p_test, mode="test", required=True)
+    p_test.add_build_func(lambda: add_applet_arg(p_test, mode="test", required=True))
 
     def factory_serial(arg):
         if re.match(r"^\d{8}T\d{6}Z$", arg):
@@ -408,25 +458,22 @@ def get_argparser():
 
 
 # The name of this function appears in Verilog output, so keep it tidy.
-def _applet(revision, args):
-    target = GlasgowHardwareTarget(revision=revision,
-                                   multiplexer_cls=DirectMultiplexer,
-                                   with_analyzer=hasattr(args, "trace") and args.trace)
-    applet = GlasgowAppletMetadata.get(args.applet).applet_cls()
+def _applet(assembly, args):
     try:
-        message = ("applet requires device rev{}+, rev{} found"
-                   .format(applet.required_revision, revision))
-        if revision < applet.required_revision:
-            if args.override_required_revision:
-                applet.logger.warning(message)
-            else:
-                raise GlasgowAppletError(message)
-        applet.build(target, args)
+        applet_cls = GlasgowAppletMetadata.get(args.applet).load()
+        match applet := applet_cls(assembly):
+            case GlasgowAppletV2():
+                applet.build(args)
+                return applet, None
+            case GlasgowApplet():
+                target = DeprecatedTarget(assembly)
+                with assembly.add_applet(applet):
+                    applet.build(target, args)
+                return applet, target
     except GlasgowAppletError as e:
         applet.logger.error(e)
-        logger.error("failed to build subtarget for applet %r", args.applet)
+        logger.error("failed to build applet %r", args.applet)
         raise SystemExit()
-    return target, applet
 
 
 class TerminalFormatter(logging.Formatter):
@@ -464,8 +511,8 @@ class SubjectFilter:
     def filter(self, record):
         levelno = record.levelno
         for subject in self.subjects:
-            if record.msg.startswith(subject + ": "):
-                levelno = logging.DEBUG
+            if isinstance(record.msg, str) and record.msg.startswith(subject + ": "):
+                levelno = logging.INFO
         return levelno >= self.level
 
 
@@ -482,6 +529,7 @@ def create_logger():
     root_logger.addHandler(term_handler)
     return term_handler
 
+
 def configure_logger(args, term_handler):
     root_logger = logging.getLogger()
 
@@ -494,7 +542,7 @@ def configure_logger(args, term_handler):
         root_logger.addHandler(file_handler)
 
     level = logging.INFO + args.quiet * 10 - args.verbose * 10
-    if level < 0:
+    if level < 0 or args.no_shorten:
         dump_hex.limit = dump_bin.limit = dump_seq.limit = dump_mapseq.limit = None
 
     if args.log_file or args.filter_log:
@@ -505,6 +553,32 @@ def configure_logger(args, term_handler):
         # place instead of filtering them later; we have a *lot* of logging, so this is much
         # more efficient.
         root_logger.setLevel(level)
+
+
+@contextlib.contextmanager
+def gc_freeze():
+    if sys.implementation.name == "cpython":
+        # Run a full garbage collection, then move all remaining objects into the permanent
+        # generation. This greatly reduces the amount of work the garbage collector has to do in a
+        # full generation 2 collection while running the applet task.
+        import gc
+        gc.collect()
+        gc.freeze()
+        yield
+        gc.unfreeze()
+    else:
+        yield
+
+
+class SIGINTCaught(Exception):
+    """This exception is necessary because asyncio recognizes both SystemExit and
+    KeyboardInterrupt and treats them specially in a way we don't need."""
+
+
+async def wait_for_sigint():
+    await wait_for_signal(signal.SIGINT)
+    logger.debug("Ctrl+C pressed, terminating")
+    raise SIGINTCaught
 
 
 async def main():
@@ -518,7 +592,8 @@ async def main():
     device = None
     try:
         if args.action not in ("build", "test", "tool", "factory", "list"):
-            device = GlasgowHardwareDevice(args.serial)
+            device = GlasgowDevice(args.serial)
+            assembly = HardwareAssembly(device=device)
 
         if args.action == "voltage":
             if args.voltage is not None:
@@ -565,149 +640,164 @@ async def main():
                       .format(port, vio, vlimit))
 
         if args.action in ("run", "repl", "script"):
-            target, applet = _applet(device.revision, args)
-            device.demultiplexer = DirectDemultiplexer(device, target.multiplexer.pipe_count)
-            plan = target.build_plan()
+            applet, target = _applet(assembly, args)
 
-            if args.prebuilt or args.bitstream:
-                bitstream_file = args.bitstream or open(f"{args.applet}.bin", "rb")
+            if args.prebuilt or args.prebuilt_at:
+                bitstream_file = args.prebuilt_at or open(f"{args.applet}.bin", "rb")
                 with bitstream_file:
-                    await device.download_prebuilt(plan, bitstream_file)
+                    await assembly.start(device, _bitstream_file=bitstream_file)
             else:
-                await device.download_target(plan, reload=args.reload)
+                await assembly.start(device, reload_bitstream=args.reload)
 
-            do_trace = hasattr(args, "trace") and args.trace
-            if do_trace:
-                logger.info("starting applet analyzer")
-                await device.write_register(target.analyzer.addr_done, 0)
-                analyzer_iface = await device.demultiplexer.claim_interface(
-                    target.analyzer, target.analyzer.mux_interface, args=None)
-                trace_decoder = TraceDecoder(target.analyzer.event_sources)
-                # Use the coarsest possible timescale to improve performance with sigrok.
-                vcd_writer = VCDWriter(args.trace, timescale="10 ns", check_values=False,
-                    comment='Generated by Glasgow for bitstream ID %s'
-                            % plan.bitstream_id.hex())
-
-            async def run_analyzer():
-                signals = {}
-                strobes = set()
-                for field_name, field_trigger, field_width in trace_decoder.events():
-                    if field_trigger == "throttle":
-                        var_type = "wire"
-                        var_init = 0
-                    elif field_trigger == "change":
-                        var_type = "wire"
-                        var_init = "x" * field_width
-                    elif field_trigger == "strobe":
-                        if field_width > 0:
-                            var_type = "tri"
-                            var_init = "z"
-                        else:
-                            var_type = "event"
-                            var_init = ""
-                    else:
-                        assert False
-                    signals[field_name] = vcd_writer.register_var(
-                        scope="", name=field_name, var_type=var_type,
-                        size=field_width, init=var_init)
-                    if field_trigger == "strobe":
-                        strobes.add(field_name)
-
-                init = True
-                while not trace_decoder.is_done():
-                    trace_decoder.process(await analyzer_iface.read())
-                    for cycle, events in trace_decoder.flush():
-                        if events == "overrun":
-                            target.analyzer.logger.error("FIFO overrun, shutting down")
-
-                            for name in signals:
-                                vcd_writer.change(signals[name], next_timestamp, "x")
-                            next_timestamp += 100 # 1us
-                            break
-
-                        event_repr = " ".join(f"{n}={v}"
-                                              for n, v in events.items())
-                        target.analyzer.logger.trace("cycle %d: %s", cycle, event_repr)
-
-                        timestamp      = int(1e8 * (cycle + 0) // target.sys_clk_freq)
-                        next_timestamp = int(1e8 * (cycle + 1) // target.sys_clk_freq)
-                        if init:
-                            init = False
-                            vcd_writer._timestamp = timestamp
-                        for name, value in events.items():
-                            vcd_writer.change(signals[name], timestamp, value)
-                        for name, _value in events.items():
-                            if name in strobes:
-                                vcd_writer.change(signals[name], next_timestamp, "z")
-                        vcd_writer.flush()
-
-                vcd_writer.close(next_timestamp)
+            if target:
+                device = DeprecatedDevice(target)
+                device.demultiplexer = DeprecatedDemultiplexer(device, target.multiplexer.pipe_count)
 
             async def run_applet():
-                logger.info("running handler for applet %r", args.applet)
-                if applet.preview:
-                    logger.warning("applet %r is PREVIEW QUALITY and may CORRUPT DATA", args.applet)
-                try:
-                    iface = await applet.run(device, args)
-                    if args.action in ("repl", "script"):
-                        if len(args.script_args) > 0 and args.script_args[0] == "--":
-                            args.script_args = args.script_args[1:]
-                    if args.action == "run":
-                        return await applet.interact(device, args, iface)
-                    elif args.action == "repl":
-                        await applet.repl(device, args, iface)
-                    elif args.action == "script":
-                        if args.script_file:
-                            code = compile(args.script_file.read(), filename=args.script_file.name,
-                                mode="exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-                        else:
-                            code = compile(args.script_cmd, filename="<command>",
-                                mode="exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
-                        future = eval(code, {"iface":iface, "device":device, "args":args})
-                        if future is not None:
-                            await future
+                if args.action in ("repl", "script"):
+                    if len(args.script_args) > 0 and args.script_args[0] == "--":
+                        args.script_args = args.script_args[1:]
 
+                logger.info("running handler for applet %r", args.applet)
+                try:
+                    match applet:
+                        case GlasgowAppletV2():
+                            await applet.setup(args)
+                            if args.action == "run":
+                                return await applet.run(args)
+                            elif args.action == "repl":
+                                await applet.repl(args)
+                            elif args.action == "script":
+                                if args.script_file:
+                                    script_code = args.script_file.read()
+                                    script_name = args.script_file.name
+                                else:
+                                    script_code = args.script_cmd
+                                    script_name = "<command>"
+                                code = compile(script_code, filename=script_name, mode="exec",
+                                    flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                                await applet.script(args, code)
+
+                        case GlasgowApplet():
+                            iface = await applet.run(device, args)
+                            if args.action == "run":
+                                return await applet.interact(device, args, iface)
+                            elif args.action == "repl":
+                                await applet.repl(device, args, iface)
+                            elif args.action == "script":
+                                if args.script_file:
+                                    code = compile(args.script_file.read(),
+                                        filename=args.script_file.name,
+                                        mode="exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                                else:
+                                    code = compile(args.script_cmd,
+                                        filename="<command>",
+                                        mode="exec", flags=ast.PyCF_ALLOW_TOP_LEVEL_AWAIT)
+                                future = eval(code, {"iface":iface, "device":device, "args":args})
+                                if future is not None:
+                                    await future
+
+                except SystemExit as e:
+                    return e.code
                 except GlasgowAppletError as e:
                     applet.logger.error(str(e))
                     return 1
                 except asyncio.CancelledError:
                     return 130 # 128 + SIGINT
-                finally:
-                    await device.demultiplexer.flush()
-                    if args.show_statistics:
-                        device.demultiplexer.statistics()
 
-            async def wait_for_sigint():
-                await wait_for_signal(signal.SIGINT)
-                logger.debug("Ctrl+C pressed, terminating")
+            try:
+                with gc_freeze():
+                    async with asyncio.TaskGroup() as group:
+                        applet_task = group.create_task(run_applet())
 
-            if do_trace:
-                analyzer_task = asyncio.ensure_future(run_analyzer())
+                        if args.action != "repl":
+                            sigint_task = group.create_task(wait_for_sigint())
+                            await asyncio.wait([applet_task])
+                            sigint_task.cancel()
+            except* SIGINTCaught:
+                pass
 
-            tasks = []
-            tasks.append(applet_task := asyncio.ensure_future(run_applet()))
-            if args.action != "repl":
-                tasks.append(asyncio.ensure_future(wait_for_sigint()))
-
-            done, pending = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in pending:
-                task.cancel()
-            await asyncio.wait(tasks, return_when=asyncio.ALL_COMPLETED)
-
-            # If the applet task has raised an exception, retrieve it here in case any of the await
-            # statements above will fail; if we don't, asyncio will unnecessarily complain.
-            applet_task.exception()
-
-            if do_trace:
-                await device.write_register(target.analyzer.addr_done, 1)
-                await analyzer_task
-
-            await device.demultiplexer.cancel()
+            await assembly.stop()
+            if args.show_statistics:
+                assembly.statistics()
 
             return applet_task.result()
 
+        if args.action == "multi":
+            assembly = HardwareAssembly(device=device)
+            applets = []
+            while args.rest:
+                try:
+                    split_at = args.rest.index("++")
+                except ValueError:
+                    split_at = len(args.rest)
+                applet_cmdline, args.rest = args.rest[:split_at], args.rest[split_at + 1:]
+                if len(applet_cmdline) < 1:
+                    logger.error(f"no applet name specified for applet #{len(applets) + 1}")
+                    return
+
+                applet_name, *applet_args = applet_cmdline
+                try:
+                    applet_parser = argparse.ArgumentParser()
+                    def argparse_exit(self, status=0, message=None):
+                        if status: raise
+                    applet_parser.exit = argparse_exit
+
+                    applet_cls = GlasgowAppletMetadata.get(applet_name).load()
+                    if not issubclass(applet_cls, GlasgowAppletV2):
+                        logger.error(f"applet {applet_name!r} must be migrated to V2 API first")
+                        return 1
+
+                    applet_cls.add_build_arguments(applet_parser,
+                        GlasgowAppletArguments(applet_name))
+                    applet_cls.add_setup_arguments(applet_parser)
+                    applet_cls.add_run_arguments(applet_parser)
+                    applet_parsed_args = applet_parser.parse_args(applet_args)
+
+                    applet = applet_cls(assembly)
+                    applet.build(applet_parsed_args)
+                    applets.append((applet, applet_name, applet_parsed_args))
+
+                except argparse.ArgumentError as exn:
+                    logger.error(f"error for applet #{len(applets) + 1} {applet_name!r}:")
+                    logger.error("%s", exn)
+                    return 1
+
+                except:
+                    logger.error(f"error building applet #{len(applets) + 1} {applet_name!r}:")
+                    raise
+
+            async with assembly:
+                for index, (applet, applet_name, applet_parsed_args) in enumerate(applets):
+                    try:
+                        await applet.setup(applet_parsed_args)
+                    except:
+                        logger.error(f"error setting up applet #{index + 1} {applet_name!r}:")
+                        raise
+
+                try:
+                    async def applet_task(applet, applet_parsed_args):
+                        await applet.run(applet_parsed_args)
+                        logger.info(f"applet #{index + 1} {applet_name!r} has finished running")
+
+                    with gc_freeze():
+                        async with asyncio.TaskGroup() as group:
+                            applet_tasks = []
+                            for applet, applet_name, applet_parsed_args in applets:
+                                applet_tasks.append(group.create_task(
+                                    applet_task(applet, applet_parsed_args),
+                                    name=f"{applet_name}#{index + 1}"
+                                ))
+
+                            sigint_task = group.create_task(wait_for_sigint())
+                            await asyncio.wait(applet_tasks)
+                            sigint_task.cancel()
+
+                except* SIGINTCaught:
+                    pass
+
         if args.action == "tool":
-            tool = GlasgowAppletMetadata.get(args.applet).tool_cls()
+            tool = GlasgowAppletToolMetadata.get(args.tool).load()()
             try:
                 return await tool.run(args)
             except GlasgowAppletError as e:
@@ -716,15 +806,15 @@ async def main():
 
         if args.action == "flash":
             logger.info("reading device configuration")
-            header = await device.read_eeprom("fx2", 0, 8 + 4 + GlasgowConfig.size)
+            header = await device.read_eeprom("fx2", 0, 8 + 4 + GlasgowDeviceConfig.size)
             header[0] = 0xC2 # see below
 
             fx2_config = FX2Config.decode(header, partial=True)
             if (len(fx2_config.firmware) != 1 or
-                    fx2_config.firmware[0][0] != 0x4000 - GlasgowConfig.size or
-                    len(fx2_config.firmware[0][1]) != GlasgowConfig.size):
+                    fx2_config.firmware[0][0] != 0x4000 - GlasgowDeviceConfig.size or
+                    len(fx2_config.firmware[0][1]) != GlasgowDeviceConfig.size):
                 raise SystemExit("Unrecognized or corrupted configuration block")
-            glasgow_config = GlasgowConfig.decode(fx2_config.firmware[0][1])
+            glasgow_config = GlasgowDeviceConfig.decode(fx2_config.firmware[0][1])
 
             logger.info("device has serial %s-%s",
                         glasgow_config.revision, glasgow_config.serial)
@@ -752,8 +842,9 @@ async def main():
                     glasgow_config.bitstream_id   = new_bitstream_id
             elif args.applet:
                 logger.info("generating bitstream for applet %s", args.applet)
-                target, applet = _applet(device.revision, args)
-                plan = target.build_plan()
+                assembly = HardwareAssembly(revision=args.rev)
+                applet, _multiplexer = _applet(assembly, args)
+                plan = assembly.artifact()
                 new_bitstream_id = plan.bitstream_id
                 new_bitstream    = plan.get_bitstream()
 
@@ -766,7 +857,7 @@ async def main():
                 glasgow_config.bitstream_size = len(new_bitstream)
                 glasgow_config.bitstream_id   = new_bitstream_id
 
-            fx2_config.firmware[0] = (0x4000 - GlasgowConfig.size, glasgow_config.encode())
+            fx2_config.firmware[0] = (0x4000 - GlasgowDeviceConfig.size, glasgow_config.encode())
 
             if args.remove_firmware:
                 logger.info("removing firmware")
@@ -784,7 +875,7 @@ async def main():
                             fx2_config.append(addr, chunk)
                 else:
                     logger.info("using built-in firmware")
-                    for (addr, chunk) in GlasgowHardwareDevice.firmware_data():
+                    for (addr, chunk) in GlasgowDevice.firmware_data():
                         fx2_config.append(addr, chunk)
                 fx2_config.disconnect = True
                 new_image = fx2_config.encode()
@@ -814,13 +905,14 @@ async def main():
                     logger.critical("configuration/firmware programming failed")
                     return 1
 
-                logger.warn("power cycle the device to apply changes")
+                logger.warning("power cycle the device to apply changes")
             else:
                 logger.info("configuration and firmware identical")
 
         if args.action == "build":
-            target, applet = _applet(args.rev, args)
-            plan = target.build_plan()
+            assembly = HardwareAssembly(revision=args.rev)
+            applet, target = _applet(assembly, args)
+            plan = assembly.artifact()
             if args.type in ("il", "rtlil"):
                 logger.info("generating RTLIL for applet %r", args.applet)
                 with open(args.filename or args.applet + ".il", "w") as f:
@@ -836,7 +928,7 @@ async def main():
 
         if args.action == "test":
             logger.info("testing applet %r", args.applet)
-            applet = GlasgowAppletMetadata.get(args.applet).applet_cls()
+            applet_cls = GlasgowAppletMetadata.get(args.applet).load()
             loader = unittest.TestLoader()
             stream = unittest.runner._WritelnDecorator(sys.stderr)
             result = unittest.TextTestResult(stream=stream, descriptions=True, verbosity=2)
@@ -846,11 +938,11 @@ async def main():
                 result.stream.write("\n")
             result.startTest = startTest
             if args.tests == []:
-                suite = loader.loadTestsFromTestCase(applet.tests())
+                suite = loader.loadTestsFromTestCase(applet_cls.tests())
                 suite.run(result)
             else:
                 for test in args.tests:
-                    suite = loader.loadTestsFromName(test, module=applet.tests())
+                    suite = loader.loadTestsFromName(test, module=applet_cls.tests())
                     suite.run(result)
             if not result.wasSuccessful():
                 for _, traceback in result.errors + result.failures:
@@ -862,11 +954,11 @@ async def main():
                 logger.error(f"--serial is not supported for factory flashing")
                 return 1
 
-            device_id = GlasgowConfig.encode_revision(args.factory_rev)
-            glasgow_config = GlasgowConfig(args.factory_rev, args.factory_serial,
+            device_id = GlasgowDeviceConfig.encode_revision(args.factory_rev)
+            glasgow_config = GlasgowDeviceConfig(args.factory_rev, args.factory_serial,
                                            manufacturer=args.factory_manufacturer,
                                            modified_design=(args.factory_modified_design != "no"))
-            firmware_data = GlasgowHardwareDevice.firmware_data()
+            firmware_data = GlasgowDevice.firmware_data()
 
             if args.reinitialize:
                 vid, pid = VID_QIHW, PID_GLASGOW
@@ -899,7 +991,7 @@ async def main():
             logger.warning("power cycle the device to finish the operation")
 
         if args.action == "list":
-            for serial in sorted(GlasgowHardwareDevice.enumerate_serials()):
+            for serial in sorted(GlasgowDevice.enumerate_serials()):
                 print(serial)
             return 0
 
@@ -910,6 +1002,7 @@ async def main():
 
     # Applet-related errors
     except GatewareBuildError as e:
+        UnusedElaboratable._MustUse__silence = True
         applet.logger.error(e)
         return 2
 
@@ -936,7 +1029,7 @@ async def main():
 
 # This entry point is invoked via `project.scripts.glasgow` when installing the package with `pipx`.
 def run_main():
-    exit(asyncio.run(main()))
+    exit(asyncio.new_event_loop().run_until_complete(main()))
 
 
 # This entry point is invoked when running `python -m glasgow.cli`.

@@ -44,7 +44,7 @@ usb_desc_device_qualifier_c usb_device_qualifier = {
   .bNumConfigurations   = 0,
 };
 
-#define USB_INTERFACE(bInterfaceNumber_, bAlternateSetting_, bNumEndpoints_, iInterface_) \
+#define USB_INTERFACE(bInterfaceNumber_, bAlternateSetting_, bNumEndpoints_)              \
   {                                                                                       \
     .bLength              = sizeof(struct usb_desc_interface),                            \
     .bDescriptorType      = USB_DESC_INTERFACE,                                           \
@@ -54,24 +54,25 @@ usb_desc_device_qualifier_c usb_device_qualifier = {
     .bInterfaceClass      = USB_IFACE_CLASS_VENDOR,                                       \
     .bInterfaceSubClass   = USB_IFACE_SUBCLASS_VENDOR,                                    \
     .bInterfaceProtocol   = USB_IFACE_PROTOCOL_VENDOR,                                    \
-    .iInterface           = iInterface_,                                                  \
+    .iInterface           = 0,                                                            \
   }
 
 usb_desc_interface_c usb_interface_0_disabled =
-  USB_INTERFACE(/*bInterfaceNumber=*/0, /*bAlternateSetting=*/0, /*bNumEndpoints=*/0,
-                /*iInterface=*/6);
-usb_desc_interface_c usb_interface_0_double =
-  USB_INTERFACE(/*bInterfaceNumber=*/0, /*bAlternateSetting=*/1, /*bNumEndpoints=*/2,
-                /*iInterface=*/7);
-usb_desc_interface_c usb_interface_0_quad =
-  USB_INTERFACE(/*bInterfaceNumber=*/0, /*bAlternateSetting=*/1, /*bNumEndpoints=*/2,
-                /*iInterface=*/8);
+  USB_INTERFACE(/*bInterfaceNumber=*/0, /*bAlternateSetting=*/0, /*bNumEndpoints=*/0);
+usb_desc_interface_c usb_interface_0_enabled =
+  USB_INTERFACE(/*bInterfaceNumber=*/0, /*bAlternateSetting=*/1, /*bNumEndpoints=*/1);
 usb_desc_interface_c usb_interface_1_disabled =
-  USB_INTERFACE(/*bInterfaceNumber=*/1, /*bAlternateSetting=*/0, /*bNumEndpoints=*/0,
-                /*iInterface=*/6);
-usb_desc_interface_c usb_interface_1_double =
-  USB_INTERFACE(/*bInterfaceNumber=*/1, /*bAlternateSetting=*/1, /*bNumEndpoints=*/2,
-                /*iInterface=*/7);
+  USB_INTERFACE(/*bInterfaceNumber=*/1, /*bAlternateSetting=*/0, /*bNumEndpoints=*/0);
+usb_desc_interface_c usb_interface_1_enabled =
+  USB_INTERFACE(/*bInterfaceNumber=*/1, /*bAlternateSetting=*/1, /*bNumEndpoints=*/1);
+usb_desc_interface_c usb_interface_2_disabled =
+  USB_INTERFACE(/*bInterfaceNumber=*/2, /*bAlternateSetting=*/0, /*bNumEndpoints=*/0);
+usb_desc_interface_c usb_interface_2_enabled =
+  USB_INTERFACE(/*bInterfaceNumber=*/2, /*bAlternateSetting=*/1, /*bNumEndpoints=*/1);
+usb_desc_interface_c usb_interface_3_disabled =
+  USB_INTERFACE(/*bInterfaceNumber=*/3, /*bAlternateSetting=*/0, /*bNumEndpoints=*/0);
+usb_desc_interface_c usb_interface_3_enabled =
+  USB_INTERFACE(/*bInterfaceNumber=*/3, /*bAlternateSetting=*/1, /*bNumEndpoints=*/1);
 
 #define USB_BULK_ENDPOINT(bEndpointAddress_)                                              \
   {                                                                                       \
@@ -96,20 +97,24 @@ usb_configuration_c usb_config_2_pipes = {
   {
     .bLength              = sizeof(struct usb_desc_configuration),
     .bDescriptorType      = USB_DESC_CONFIGURATION,
-    .bNumInterfaces       = 2,
+    .bNumInterfaces       = 4,
     .bConfigurationValue  = 1,
-    .iConfiguration       = 4,
+    .iConfiguration       = 0,
     .bmAttributes         = USB_ATTR_RESERVED_1,
     .bMaxPower            = 250,
   },
   {
     { .interface  = &usb_interface_0_disabled },
-    { .interface  = &usb_interface_0_double   },
+    { .interface  = &usb_interface_0_enabled  },
     { .endpoint   = &usb_endpoint_2_out       },
-    { .endpoint   = &usb_endpoint_6_in        },
     { .interface  = &usb_interface_1_disabled },
-    { .interface  = &usb_interface_1_double   },
+    { .interface  = &usb_interface_1_enabled  },
     { .endpoint   = &usb_endpoint_4_out       },
+    { .interface  = &usb_interface_2_disabled },
+    { .interface  = &usb_interface_2_enabled  },
+    { .endpoint   = &usb_endpoint_6_in        },
+    { .interface  = &usb_interface_3_disabled },
+    { .interface  = &usb_interface_3_enabled  },
     { .endpoint   = &usb_endpoint_8_in        },
     { 0 }
   }
@@ -119,16 +124,18 @@ usb_configuration_c usb_config_1_pipe = {
   {
     .bLength              = sizeof(struct usb_desc_configuration),
     .bDescriptorType      = USB_DESC_CONFIGURATION,
-    .bNumInterfaces       = 1,
+    .bNumInterfaces       = 2,
     .bConfigurationValue  = 2,
-    .iConfiguration       = 5,
+    .iConfiguration       = 0,
     .bmAttributes         = USB_ATTR_RESERVED_1,
     .bMaxPower            = 250,
   },
   {
     { .interface  = &usb_interface_0_disabled },
-    { .interface  = &usb_interface_0_quad     },
+    { .interface  = &usb_interface_0_enabled  },
     { .endpoint   = &usb_endpoint_2_out       },
+    { .interface  = &usb_interface_1_disabled },
+    { .interface  = &usb_interface_1_enabled  },
     { .endpoint   = &usb_endpoint_6_in        },
     { 0 }
   }
@@ -152,13 +159,6 @@ usb_ascii_string_c usb_strings[] = {
   [0] = "whitequark research\0\0\0", // CONFIG_SIZE_MANUFACTURER characters long
   [1] = "Glasgow Interface Explorer (git " GIT_REVISION ")",
   [2] = "XX-XXXXXXXXXXXXXXXX",
-  // Configurations
-  [3] = "Pipe P at {2x512B EP2OUT/EP6IN}, Q at {2x512B EP4OUT/EP8IN}",
-  [4] = "Pipe P at {4x512B EP2OUT/EP6IN}",
-  // Interfaces
-  [5] = "Disabled",
-  [6] = "Double-buffered 512B",
-  [7] = "Quad-buffered 512B",
 };
 
 usb_descriptor_set_c usb_descriptor_set = {
@@ -323,9 +323,9 @@ static uint8_t status;
 static void update_err_led() {
   if(!test_leds) {
     if(status & (ST_ERROR | ST_ALERT))
-      IOD |=  (1<<PIND_LED_ERR);
+      IO_LED_ERR = 1;
     else
-      IOD &= ~(1<<PIND_LED_ERR);
+      IO_LED_ERR = 0;
   }
 }
 
@@ -379,16 +379,22 @@ bool handle_usb_set_configuration(uint8_t config_value) {
 
 bool handle_usb_set_interface(uint8_t interface, uint8_t alt_setting) {
   bool two_ep;
+  uint8_t ep_mask;
 
   switch(usb_config_value) {
-    case 1: two_ep = false; break;
-    case 2: two_ep = true;  break;
+    case 1: two_ep = false; ep_mask = 1 <<      interface;  break;
+    case 2: two_ep = true;  ep_mask = 1 << (2 * interface); break;
     default: return false;
   }
 
+  if (!fpga_pipe_rst(/*set=*/ep_mask, /*clr=*/0))
+    return false;
+
+  fifo_reset(two_ep, ep_mask);
+
   if(alt_setting == 1) {
-    // The interface is being (re)activated, so reset the FIFOs.
-    fifo_reset(two_ep, (1 << interface));
+    if (!fpga_pipe_rst(/*set=*/0, /*clr=*/ep_mask))
+      return false;
   }
 
   usb_alt_setting[interface] = alt_setting;
@@ -408,9 +414,15 @@ uint16_t bitstream_idx;
 
 void handle_pending_usb_setup() {
   __xdata struct usb_req_setup *req = (__xdata struct usb_req_setup *)SETUPDAT;
+  register bool req_dir_in = (req->bmRequestType & USB_DIR_IN);
+
+  if(req->bmRequestType != (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) &&
+     req->bmRequestType != (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT)) {
+    goto stall_ep0_return;
+  }
 
   // EEPROM read/write requests
-  if(req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT) &&
+  if(!req_dir_in &&
      req->bRequest == USB_REQ_LIBFX2_PAGE_SIZE) {
     pending_setup = false;
 
@@ -419,11 +431,8 @@ void handle_pending_usb_setup() {
     return;
   }
 
-  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) ||
-      req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT)) &&
-     (req->bRequest == USB_REQ_CYPRESS_EEPROM_DB ||
+  if((req->bRequest == USB_REQ_CYPRESS_EEPROM_DB ||
       req->bRequest == USB_REQ_EEPROM)) {
-    bool     arg_read = (req->bmRequestType & USB_DIR_IN);
     uint8_t  arg_chip = 0;
     uint16_t arg_addr = req->wValue;
     uint16_t arg_len  = req->wLength;
@@ -460,18 +469,16 @@ void handle_pending_usb_setup() {
     pending_setup = false;
 
     if(!arg_chip) {
-      STALL_EP0();
-      return;
+      goto stall_ep0_return;
     }
 
     while(arg_len > 0) {
       uint8_t chunk_len = arg_len < 64 ? arg_len : 64;
 
-      if(arg_read) {
+      if(req_dir_in) {
         while(EP0CS & _BUSY);
         if(!eeprom_read(arg_chip, arg_addr, EP0BUF, chunk_len, /*double_byte=*/true)) {
-          STALL_EP0();
-          break;
+          goto stall_ep0_return;
         }
         SETUP_EP0_BUF(chunk_len);
       } else {
@@ -479,8 +486,7 @@ void handle_pending_usb_setup() {
         while(EP0CS & _BUSY);
         if(!eeprom_write(arg_chip, arg_addr, EP0BUF, chunk_len, /*double_byte=*/true,
                          page_size, timeout)) {
-          STALL_EP0();
-          break;
+          goto stall_ep0_return;
         }
       }
 
@@ -492,16 +498,13 @@ void handle_pending_usb_setup() {
   }
 
   // FPGA register read/write requests
-  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) ||
-      req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT)) &&
-     req->bRequest == USB_REQ_REGISTER) {
-    bool     arg_read = (req->bmRequestType & USB_DIR_IN);
+  if(req->bRequest == USB_REQ_REGISTER) {
     uint8_t  arg_addr = req->wValue;
     uint16_t arg_len  = req->wLength;
     pending_setup = false;
 
     if(fpga_reg_select(arg_addr)) {
-      if(arg_read) {
+      if(req_dir_in) {
         while(EP0CS & _BUSY);
         if(fpga_reg_read(EP0BUF, arg_len)) {
           SETUP_EP0_BUF(arg_len);
@@ -515,12 +518,11 @@ void handle_pending_usb_setup() {
       }
     }
 
-    STALL_EP0();
-    return;
+    goto stall_ep0_return;
   }
 
   // Device status request
-  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN)) &&
+  if(req_dir_in &&
      req->bRequest == USB_REQ_STATUS &&
      req->wLength == 1) {
     pending_setup = false;
@@ -536,7 +538,7 @@ void handle_pending_usb_setup() {
   }
 
   // Bitstream download request
-  if(req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT) &&
+  if(!req_dir_in &&
      req->bRequest == USB_REQ_FPGA_CFG &&
      (req->wIndex == 0 || req->wIndex == bitstream_idx + 1)) {
     uint16_t arg_idx = req->wIndex;
@@ -563,14 +565,11 @@ void handle_pending_usb_setup() {
   }
 
   // Bitstream ID get/set request
-  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) ||
-      req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT)) &&
-     req->bRequest == USB_REQ_BITSTREAM_ID &&
+  if(req->bRequest == USB_REQ_BITSTREAM_ID &&
      req->wLength == CONFIG_SIZE_BITSTREAM_ID) {
-    bool arg_get = (req->bmRequestType & USB_DIR_IN);
     pending_setup = false;
 
-    if(arg_get) {
+    if(req_dir_in) {
       while(EP0CS & _BUSY);
       xmemcpy(EP0BUF, glasgow_config.bitstream_id, CONFIG_SIZE_BITSTREAM_ID);
       SETUP_EP0_BUF(CONFIG_SIZE_BITSTREAM_ID);
@@ -580,7 +579,7 @@ void handle_pending_usb_setup() {
         while(EP0CS & _BUSY);
         xmemcpy(glasgow_config.bitstream_id, EP0BUF, CONFIG_SIZE_BITSTREAM_ID);
       } else {
-        STALL_EP0();
+        goto stall_ep0_return;
       }
     }
 
@@ -588,18 +587,15 @@ void handle_pending_usb_setup() {
   }
 
   // I/O voltage get/set request
-  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) ||
-      req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT)) &&
-     req->bRequest == USB_REQ_IO_VOLT &&
+  if(req->bRequest == USB_REQ_IO_VOLT &&
      req->wLength == 2) {
-    bool     arg_get = (req->bmRequestType & USB_DIR_IN);
     uint8_t  arg_mask = req->wIndex;
     pending_setup = false;
 
-    if(arg_get) {
+    if(req_dir_in) {
       while(EP0CS & _BUSY);
       if(!iobuf_get_voltage(arg_mask, (__xdata uint16_t *)EP0BUF)) {
-        STALL_EP0();
+        goto stall_ep0_return;
       } else {
         SETUP_EP0_BUF(2);
       }
@@ -615,7 +611,7 @@ void handle_pending_usb_setup() {
   }
 
   // Voltage sense request
-  if(req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) &&
+  if(req_dir_in &&
      req->bRequest == USB_REQ_SENSE_VOLT &&
      req->wLength == 2) {
     uint8_t  arg_mask = req->wIndex;
@@ -630,7 +626,7 @@ void handle_pending_usb_setup() {
       result = iobuf_measure_voltage_adc081c(arg_mask, (__xdata uint16_t *)EP0BUF);
 
     if(!result) {
-      STALL_EP0();
+      goto stall_ep0_return;
     } else {
       SETUP_EP0_BUF(2);
     }
@@ -639,16 +635,13 @@ void handle_pending_usb_setup() {
   }
 
   // Voltage alert get/set request
-  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) ||
-      req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT)) &&
-     req->bRequest == USB_REQ_ALERT_VOLT &&
+  if(req->bRequest == USB_REQ_ALERT_VOLT &&
      req->wLength == 4) {
-    bool     arg_get = (req->bmRequestType & USB_DIR_IN);
     uint8_t  arg_mask = req->wIndex;
     pending_setup = false;
     bool result;
 
-    if(arg_get) {
+    if(req_dir_in) {
       while(EP0CS & _BUSY);
 
       if(glasgow_config.revision >= GLASGOW_REV_C2)
@@ -657,7 +650,7 @@ void handle_pending_usb_setup() {
         result = iobuf_get_alert_adc081c(arg_mask, (__xdata uint16_t *)EP0BUF, (__xdata uint16_t *)EP0BUF + 1);
 
       if(!result) {
-        STALL_EP0();
+        goto stall_ep0_return;
       } else {
         SETUP_EP0_BUF(4);
       }
@@ -679,7 +672,7 @@ void handle_pending_usb_setup() {
   }
 
   // Alert poll request
-  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN)) &&
+  if(req_dir_in &&
      req->bRequest == USB_REQ_POLL_ALERT &&
      req->wLength == 1) {
     pending_setup = false;
@@ -694,7 +687,7 @@ void handle_pending_usb_setup() {
       result = iobuf_poll_alert_adc081c(EP0BUF, /*clear=*/true);
 
     if(!result) {
-      STALL_EP0();
+      goto stall_ep0_return;
     } else {
       SETUP_EP0_BUF(1);
       // Clear the ERR led since we cleared the alert status above
@@ -705,7 +698,7 @@ void handle_pending_usb_setup() {
   }
 
   // I/O buffer enable request
-  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT)) &&
+  if(!req_dir_in &&
      req->bRequest == USB_REQ_IOBUF_ENABLE &&
      req->wLength == 0) {
     bool arg_enable = req->wValue;
@@ -718,18 +711,15 @@ void handle_pending_usb_setup() {
   }
 
   // I/O voltage limit get/set request
-  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) ||
-      req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT)) &&
-     req->bRequest == USB_REQ_LIMIT_VOLT &&
+  if(req->bRequest == USB_REQ_LIMIT_VOLT &&
      req->wLength == 2) {
-    bool     arg_get = (req->bmRequestType & USB_DIR_IN);
     uint8_t  arg_mask = req->wIndex;
     pending_setup = false;
 
-    if(arg_get) {
+    if(req_dir_in) {
       while(EP0CS & _BUSY);
       if(!iobuf_get_voltage_limit(arg_mask, (__xdata uint16_t *)EP0BUF)) {
-        STALL_EP0();
+        goto stall_ep0_return;
       } else {
         SETUP_EP0_BUF(2);
       }
@@ -753,21 +743,18 @@ void handle_pending_usb_setup() {
   }
 
   // Pull resistor get/set request
-  if((req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) ||
-      req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT)) &&
-     req->bRequest == USB_REQ_PULL &&
+  if(req->bRequest == USB_REQ_PULL &&
      req->wLength == 2) {
-    bool     arg_get = (req->bmRequestType & USB_DIR_IN);
     uint8_t  arg_selector = req->wIndex;
     pending_setup = false;
 
-    if(arg_get) {
+    if(req_dir_in){
       while(EP0CS & _BUSY);
       if(glasgow_config.revision < GLASGOW_REV_C0 ||
          !iobuf_get_pull(arg_selector,
                          (__xdata uint8_t *)EP0BUF + 0,
                          (__xdata uint8_t *)EP0BUF + 1)) {
-        STALL_EP0();
+        goto stall_ep0_return;
       } else {
         SETUP_EP0_BUF(2);
       }
@@ -786,7 +773,7 @@ void handle_pending_usb_setup() {
   }
 
   // LED test mode request
-  if(req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_OUT) &&
+  if(!req_dir_in &&
      req->bRequest == USB_REQ_TEST_LEDS &&
      req->wLength == 0) {
     uint8_t arg_states = req->wIndex;
@@ -802,7 +789,7 @@ void handle_pending_usb_setup() {
   }
 
   // Only used by old checkouts of software, can be removed.
-  if(req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) &&
+  if(req_dir_in &&
      req->bRequest == USB_REQ_API_LEVEL &&
      req->wLength == 1) {
     pending_setup = false;
@@ -814,7 +801,7 @@ void handle_pending_usb_setup() {
   }
 
   // Microsoft descriptor requests
-  if(req->bmRequestType == (USB_RECIP_DEVICE|USB_TYPE_VENDOR|USB_DIR_IN) &&
+  if(req_dir_in &&
      req->bRequest == USB_REQ_GET_MS_DESCRIPTOR &&
      req->wIndex == USB_DESC_MS_EXTENDED_COMPAT_ID) {
     pending_setup = false;
@@ -823,7 +810,7 @@ void handle_pending_usb_setup() {
     SETUP_EP0_IN_DESC(scratch);
     return;
   }
-  if(req->bmRequestType == (USB_RECIP_IFACE|USB_TYPE_VENDOR|USB_DIR_IN) &&
+  if(req_dir_in &&
      req->bRequest == USB_REQ_GET_MS_DESCRIPTOR &&
      req->wIndex == USB_DESC_MS_EXTENDED_PROPERTIES) {
     pending_setup = false;
@@ -833,6 +820,9 @@ void handle_pending_usb_setup() {
     return;
   }
 
+  // Factor out the stall exit to reduce code size.
+stall_ep0_return:
+  pending_setup = false;
   STALL_EP0();
 }
 
@@ -881,14 +871,14 @@ void handle_pending_alert() {
 
 void isr_TF2() __interrupt(_INT_TF2) {
   if (!test_leds)
-    IOD &= ~(1<<PIND_LED_ACT);
+    IO_LED_ACT = 0;
   TR2 = false;
   TF2 = false;
 }
 
 static void isr_EPn() __interrupt {
   if (!test_leds)
-    IOD |= (1<<PIND_LED_ACT);
+    IO_LED_ACT = 1;
   // Just let it run, at the maximum reload value we get a pulse width of around 16ms.
   TR2 = true;
   // Clear all EPn IRQs, since we don't really need this IRQ to be fine-grained.
@@ -933,7 +923,7 @@ int main() {
 
   // Set up LEDs.
   OED |= (1<<PIND_LED_FX2)|(1<<PIND_LED_ACT)|(1<<PIND_LED_ERR);
-  IOD |= (1<<PIND_LED_FX2);
+  IO_LED_FX2 = 1;
   IOD &=                 ~((1<<PIND_LED_ACT)|(1<<PIND_LED_ERR));
 
   // Use timer 2 in 16-bit timer mode for ACT LED.
@@ -953,7 +943,7 @@ int main() {
     uint16_t addr = 0;
 
     // Loading the bitstream over I2C can take up to five seconds.
-    IOD |=  (1<<PIND_LED_ACT);
+    IO_LED_ACT = 1;
 
     fpga_reset();
     while(length > 0) {
@@ -984,7 +974,7 @@ int main() {
         latch_status_bit(ST_ERROR);
     }
 
-    IOD &= ~(1<<PIND_LED_ACT);
+    IO_LED_ACT = 0;
   }
 
   // Finally, enumerate.
@@ -998,7 +988,7 @@ int main() {
       handle_pending_alert();
 
     // There are few things more frustrating than having your debug tools fail you.
-    // Data-only USB cables are regretfully common. If the device finds itself without
+    // Power-only USB cables are regretfully common. If the device finds itself without
     // an address it should indicate this unusual condition, though in a gentle way
     // because there are legitimate reasons for this to happen (PC in suspend, Glasgow
     // used 'offline', etc).
@@ -1007,14 +997,14 @@ int main() {
         // If no address is assigned, slowly breathe. (Or, during enumeration, abruptly
         // blink. That's okay though.)
         switch (USBFRAMEH >> 1) {
-          case 0b00: IOD |=  (1<<PIND_LED_FX2); break;
-          case 0b01: IOD ^=  (1<<PIND_LED_FX2); break;
-          case 0b10: IOD &= ~(1<<PIND_LED_FX2); break;
-          case 0b11: IOD ^=  (1<<PIND_LED_FX2); break;
+          case 0b00: IO_LED_FX2 = 1; break;
+          case 0b10: IO_LED_FX2 = 0; break;
+          case 0b01:
+          case 0b11: IO_LED_FX2 ^= 1; break;
         }
       } else {
         // Got plugged in, light up permanently.
-        IOD |= (1<<PIND_LED_FX2);
+        IO_LED_FX2 = 1;
       }
     }
   }

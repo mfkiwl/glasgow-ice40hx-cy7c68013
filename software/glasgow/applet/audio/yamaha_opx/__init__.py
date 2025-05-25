@@ -143,21 +143,21 @@ import asyncio
 import aiohttp, aiohttp.web
 import hashlib
 import gzip
-import io
+from io import BytesIO
 from amaranth import *
 from amaranth.lib import data
+from amaranth.lib import io
 from amaranth.lib.cdc import FFSynchronizer
 from urllib.parse import urlparse
 
-from ....gateware.pads import *
 from ....gateware.clockgen import *
 from ....protocol.vgm import *
 from ... import *
 
 
 class YamahaCPUBus(Elaboratable):
-    def __init__(self, pads, master_cyc):
-        self.pads = pads
+    def __init__(self, ports, master_cyc):
+        self.ports = ports
         self.master_cyc = master_cyc
 
         self.rst   = Signal()
@@ -181,37 +181,36 @@ class YamahaCPUBus(Elaboratable):
         m.submodules.clkgen = clkgen = EnableInserter(self.clkgen_ce)(ClockGen(self.master_cyc))
         m.d.comb += self.stb_m.eq(clkgen.stb_r)
 
+        m.submodules.clk_m_buffer = clk_m_buffer = io.Buffer("o", self.ports.clk_m)
+        m.submodules.a_buffer     = a_buffer     = io.Buffer("o", self.ports.a)
+        m.submodules.d_buffer     = d_buffer     = io.Buffer("io", self.ports.d)
+        m.submodules.rd_buffer    = rd_buffer    = io.Buffer("o", self.ports.rd)
+        m.submodules.wr_buffer    = wr_buffer    = io.Buffer("o", self.ports.wr)
+
         m.d.comb += [
-            self.pads.clk_m_t.oe.eq(1),
-            self.pads.clk_m_t.o.eq(clkgen.clk),
-            self.pads.a_t.oe.eq(1),
-            self.pads.a_t.o.eq(self.a),
-            self.pads.d_t.oe.eq(self.oe),
-            self.pads.d_t.o.eq(self.do),
-            self.di.eq(self.pads.d_t.i),
+            clk_m_buffer.o.eq(clkgen.clk),
+            a_buffer.o.eq(self.a),
+            d_buffer.oe.eq(self.oe),
+            d_buffer.o.eq(self.do),
+            self.di.eq(d_buffer.i),
             # handle (self.rd & (self.wr | self.oe)) == 1 safely
-            self.pads.rd_t.oe.eq(1),
-            self.pads.rd_t.o.eq(~(self.rd & ~self.wr & ~self.oe)),
-            self.pads.wr_t.oe.eq(1),
-            self.pads.wr_t.o.eq(~(self.wr & ~self.rd)),
+            rd_buffer.o.eq(~(self.rd & ~self.wr & ~self.oe)),
+            wr_buffer.o.eq(~(self.wr & ~self.rd)),
         ]
-        if hasattr(self.pads, "cs_t"):
-            m.d.comb += [
-                self.pads.cs_t.oe.eq(1),
-                self.pads.cs_t.o.eq(~self.cs),
-            ]
-        if hasattr(self.pads, "ic_t"):
-            m.d.comb += [
-                self.pads.ic_t.oe.eq(1),
-                self.pads.ic_t.o.eq(~self.rst),
-            ]
+
+        if self.ports.cs is not None:
+            m.submodules.cs_buffer = cs_buffer = io.Buffer("o", self.ports.cs)
+            m.d.comb += cs_buffer.o.eq(~self.cs),
+        if self.ports.ic is not None:
+            m.submodules.ic_buffer = ic_buffer = io.Buffer("o", self.ports.ic)
+            m.d.comb += ic_buffer.o.eq(~self.rst),
 
         return m
 
 
 class YamahaDACBus(Elaboratable):
-    def __init__(self, pads):
-        self.pads = pads
+    def __init__(self, ports):
+        self.ports = ports
 
         self.stb_sy = Signal()
         self.stb_sh = Signal()
@@ -235,10 +234,14 @@ class YamahaDACBus(Elaboratable):
             self.stb_sh.eq(sh_r & ~self.sh)
         ]
 
+        m.submodules.clk_sy_buffer = clk_sy_buffer = io.Buffer("i", self.ports.clk_sy)
+        m.submodules.sh_buffer     = sh_buffer     = io.Buffer("i", self.ports.sh)
+        m.submodules.mo_buffer     = mo_buffer     = io.Buffer("i", self.ports.mo)
+
         m.submodules += [
-            FFSynchronizer(self.pads.clk_sy_t.i, clk_sy_s),
-            FFSynchronizer(self.pads.sh_t.i, self.sh),
-            FFSynchronizer(self.pads.mo_t.i, self.mo)
+            FFSynchronizer(clk_sy_buffer.i, clk_sy_s),
+            FFSynchronizer(sh_buffer.i, self.sh),
+            FFSynchronizer(mo_buffer.i, self.mo)
         ]
 
         return m
@@ -252,7 +255,7 @@ OP_MASK   = 0xf0
 
 
 class YamahaOPxSubtarget(Elaboratable):
-    def __init__(self, pads, in_fifo, out_fifo, sample_decoder_cls, channel_count,
+    def __init__(self, ports, in_fifo, out_fifo, sample_decoder_cls, channel_count,
                  master_cyc, read_pulse_cyc, write_pulse_cyc,
                  address_clocks, data_clocks):
         self.in_fifo = in_fifo
@@ -264,8 +267,8 @@ class YamahaOPxSubtarget(Elaboratable):
         self.data_clocks = data_clocks
 
         self.decoder = sample_decoder_cls()
-        self.cpu_bus = YamahaCPUBus(pads, master_cyc)
-        self.dac_bus = YamahaDACBus(pads)
+        self.cpu_bus = YamahaCPUBus(ports, master_cyc)
+        self.dac_bus = YamahaDACBus(ports)
 
     def elaborate(self, platform):
         m = Module()
@@ -818,10 +821,13 @@ class YamahaOPxWebInterface:
     def __init__(self, logger, opx_iface, set_voltage, allow_urls):
         self._logger    = logger
         self._opx_iface = opx_iface
-        self._lock      = asyncio.Lock()
+
+        self._lock       = asyncio.Lock()
+        self._queue_len  = 0
+        self._queue_cond = asyncio.Condition()
 
         self._set_voltage = set_voltage
-        self._allow_urls = allow_urls
+        self._allow_urls  = allow_urls
 
     async def serve_index(self, request):
         with open(os.path.join(os.path.dirname(__file__), "index.html")) as f:
@@ -831,6 +837,28 @@ class YamahaOPxWebInterface:
             index_html = index_html.replace("{{url_display}}",
                                             "block" if self._allow_urls else "none")
             return aiohttp.web.Response(text=index_html, content_type="text/html")
+
+    async def _update_queue_len(self, delta):
+        await self._queue_cond.acquire()
+        self._queue_len += delta
+        self._queue_cond.notify_all()
+        self._queue_cond.release()
+
+    async def serve_queue(self, request):
+        sock = aiohttp.web.WebSocketResponse()
+        await sock.prepare(request)
+
+        try:
+            while True:
+                await self._queue_cond.acquire()
+                try:
+                    await sock.send_json({"len": self._queue_len})
+                    await self._queue_cond.wait()
+                finally:
+                    self._queue_cond.release()
+
+        except aiohttp.ClientConnectionResetError:
+            pass
 
     async def serve_vgm(self, request):
         sock = aiohttp.web.WebSocketResponse()
@@ -882,7 +910,7 @@ class YamahaOPxWebInterface:
                 raise ValueError("File is too short to be valid")
 
             try:
-                vgm_stream = io.BytesIO(vgm_data)
+                vgm_stream = BytesIO(vgm_data)
                 if not vgm_data.startswith(b"Vgm "):
                     vgm_stream = gzip.GzipFile(fileobj=vgm_stream)
 
@@ -918,6 +946,8 @@ class YamahaOPxWebInterface:
         sample_rate = 1 / vgm_player.sample_time
         self._logger.info("web: %s: sample rate %d", digest, sample_rate)
 
+        await self._update_queue_len(+1)
+
         async with self._lock:
             try:
                 voltage = float(headers["Voltage"])
@@ -925,6 +955,8 @@ class YamahaOPxWebInterface:
                 await self._set_voltage(voltage)
 
             except Exception as error:
+                await self._update_queue_len(-1)
+
                 await sock.close(code=2000, message=str(error))
                 return sock
 
@@ -997,13 +1029,17 @@ class YamahaOPxWebInterface:
                         fut.cancel()
                 raise
 
+            finally:
+                await self._update_queue_len(-1)
+
             return sock
 
     async def serve(self, endpoint):
         app = aiohttp.web.Application()
         app.add_routes([
-            aiohttp.web.get("/",    self.serve_index),
-            aiohttp.web.get("/vgm", self.serve_vgm),
+            aiohttp.web.get("/",      self.serve_index),
+            aiohttp.web.get("/queue", self.serve_queue),
+            aiohttp.web.get("/vgm",   self.serve_vgm),
         ])
 
         try:
@@ -1067,25 +1103,20 @@ class AudioYamahaOPxApplet(GlasgowApplet):
                 return (address, data)
     """
 
-    __pin_sets = ("d", "a")
-    __pins = ("wr", "rd", "clk_m",
-              "sh", "mo", "clk_sy",
-              "cs", "ic")
-
     @classmethod
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
-        access.add_pin_set_argument(parser, "d", width=8, default=True)
-        access.add_pin_set_argument(parser, "a", width=range(1, 3), default=2)
-        access.add_pin_argument(parser, "wr", default=True)
-        access.add_pin_argument(parser, "rd", default=True)
-        access.add_pin_argument(parser, "clk_m", default=True)
-        access.add_pin_argument(parser, "sh", default=True)
-        access.add_pin_argument(parser, "mo", default=True)
-        access.add_pin_argument(parser, "clk_sy", default=True)
-        access.add_pin_argument(parser, "cs", required=False)
-        access.add_pin_argument(parser, "ic", required=False)
+        access.add_pins_argument(parser, "d", width=8, default=True)
+        access.add_pins_argument(parser, "a", width=range(1, 3), default=2)
+        access.add_pins_argument(parser, "wr", default=True)
+        access.add_pins_argument(parser, "rd", default=True)
+        access.add_pins_argument(parser, "clk_m", default=True)
+        access.add_pins_argument(parser, "sh", default=True)
+        access.add_pins_argument(parser, "mo", default=True)
+        access.add_pins_argument(parser, "clk_sy", default=True)
+        access.add_pins_argument(parser, "cs", required=False)
+        access.add_pins_argument(parser, "ic", required=False)
 
         parser.add_argument(
             "-d", "--device", metavar="DEVICE", choices=["OPL", "OPL2", "OPL3", "OPM"],
@@ -1112,7 +1143,18 @@ class AudioYamahaOPxApplet(GlasgowApplet):
 
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
         subtarget = iface.add_subtarget(YamahaOPxSubtarget(
-            pads=iface.get_pads(args, pins=self.__pins, pin_sets=self.__pin_sets),
+            ports=iface.get_port_group(
+                d      = args.d,
+                a      = args.a,
+                wr     = args.wr,
+                rd     = args.rd,
+                clk_m  = args.clk_m,
+                sh     = args.sh,
+                mo     = args.mo,
+                clk_sy = args.clk_sy,
+                cs     = args.cs,
+                ic     = args.ic
+            ),
             out_fifo=iface.get_out_fifo(),
             in_fifo=iface.get_in_fifo(auto_flush=False),
             sample_decoder_cls=device_iface_cls.sample_decoder,
@@ -1227,7 +1269,7 @@ class AudioYamahaOPxApplet(GlasgowApplet):
 
         if args.operation == "web":
             async def set_voltage(voltage):
-                await device.set_voltage(args.port_spec, voltage)
+                await device.set_voltage("AB", voltage)
             web_iface = YamahaOPxWebInterface(self.logger, opx_iface, set_voltage, args.allow_urls)
             await web_iface.serve(args.endpoint)
 

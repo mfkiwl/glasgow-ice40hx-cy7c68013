@@ -47,7 +47,7 @@ As the startup prompt suggests, investigating ``help(iface)`` and ``help(device)
 I²C
 ~~~
 
-For this example, I will be using the `Sparkfun BMP085 <https://www.sparkfun.com/products/retired/9694>`_ (a now-retired breakout for an I²C barometric pressure sensor), which supports 3.3v operation.
+For this example, I will be using the `Sparkfun BMP085 <https://web.archive.org/web/20230206233109/https://www.sparkfun.com/products/retired/9694>`_ (a now-retired breakout for an I²C barometric pressure sensor), which supports 3.3v operation.
 
 .. note::
     I²C busses are implemented using open-drain, meaning that pull-up resistors are `required`... Glasgow's onboard 10kΩ pull-ups can be enabled by passing the ``--pulls`` argument --- while they will generally be enough, they may not suffice for fast or long busses. This particular breakout board has on-board pull-ups already, so it's not necessary to use them.
@@ -129,7 +129,7 @@ The UART applet also keeps track of some statistics for us:
 WS2812
 ~~~~~~
 
-I've got a `quater of an Adafruit 60 LED ring <https://www.adafruit.com/product/1768>`_... that's 15x WS2812 RGB LEDs.
+I've got a `quarter of an Adafruit 60 LED ring <https://www.adafruit.com/product/1768>`_... that's 15x WS2812 RGB LEDs.
 
 .. note::
 
@@ -137,7 +137,7 @@ I've got a `quater of an Adafruit 60 LED ring <https://www.adafruit.com/product/
 
 .. code:: console
 
-    $ glasgow repl video-ws2812-output -V 5 -c 15 -b 1 -f RGB-xBRG --pins-out 0
+    $ glasgow repl video-ws2812-output -V 5 -c 15 -b 1 -f RGB-xBRG --out A0
     I: g.device.hardware: device already has bitstream ID d8987a037e451abe4ffa1b6f76fd1116
     I: g.cli: running handler for applet 'video-ws2812-output'
     I: g.applet.video.ws2812_output: port(s) A, B voltage set to 5.0 V
@@ -177,6 +177,8 @@ And all off again, followed by a full power-down of the I/O:
 Hopefully this example starts to show you the power you have available.
 
 
+.. _script-usage:
+
 How do I use a script?
 ----------------------
 
@@ -201,7 +203,7 @@ Of course you're also able to setup ``argparse`` or do whatever argument parsing
     I: g.applet.interface.i2c_initiator: port(s) A, B voltage set to 3.3 V
     I: g.applet.interface.i2c_initiator: dropping to REPL; use 'help(iface)' to see available APIs
     >>> args
-    Namespace(verbose=0, quiet=0, log_file=None, filter_log=None, show_statistics=False, serial=None, action='repl', override_required_revision=False, reload=False, prebuilt=False, bitstream=None, trace=None, applet='i2c-initiator', port_spec='AB', pin_scl=0, pin_sda=1, bit_rate=100, voltage=3.3, mirror_voltage=False, keep_voltage=False, pulls=True, script_args=['test', 'me'])
+    Namespace(verbose=0, quiet=0, log_file=None, filter_log=None, no_shorten=False, show_statistics=False, serial=None, action='repl', override_required_revision=False, reload=False, prebuilt=False, prebuilt_at=None, applet='i2c-initiator', scl=PinArgument(number=0, invert=False), sda=PinArgument(number=1, invert=False), bit_rate=100, voltage=[VoltArgument(ports='AB', value=3.3, sense=None)], pulls=True, script_args=['test', 'me'])
     >>> args.script_args
     ['test', 'me']
     >>>

@@ -4,7 +4,6 @@ import enum
 from abc import ABCMeta, abstractmethod
 from amaranth import *
 
-from ....gateware.pads import *
 from ....gateware.i2c import I2CTarget
 from ... import *
 
@@ -18,8 +17,8 @@ class Event(enum.IntEnum):
 
 
 class I2CTargetSubtarget(Elaboratable):
-    def __init__(self, pads, out_fifo, in_fifo, address):
-        self.pads       = pads
+    def __init__(self, ports, out_fifo, in_fifo, address):
+        self.ports      = ports
         self.out_fifo   = out_fifo
         self.in_fifo    = in_fifo
         self.address    = address
@@ -27,7 +26,7 @@ class I2CTargetSubtarget(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.i2c_target = i2c_target = I2CTarget(self.pads)
+        m.submodules.i2c_target = i2c_target = I2CTarget(self.ports)
         m.d.comb += i2c_target.address.eq(self.address)
 
         with m.FSM():
@@ -204,15 +203,14 @@ class I2CTargetApplet(GlasgowApplet):
     """
     required_revision = "C0"
 
-    __pins = ("scl", "sda")
     interface_cls = _DummyI2CTargetInterface
 
     @classmethod
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
-        for pin in cls.__pins:
-            access.add_pin_argument(parser, pin, default=True)
+        access.add_pins_argument(parser, "scl", default=True)
+        access.add_pins_argument(parser, "sda", default=True)
 
         def i2c_address(arg):
             return int(arg, 0)
@@ -223,7 +221,7 @@ class I2CTargetApplet(GlasgowApplet):
     def build(self, target, args):
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
         iface.add_subtarget(I2CTargetSubtarget(
-            pads=iface.get_pads(args, pins=self.__pins),
+            ports=iface.get_port_group(scl=args.scl, sda=args.sda),
             out_fifo=iface.get_out_fifo(),
             in_fifo=iface.get_in_fifo(),
             address=args.address,
@@ -240,7 +238,7 @@ class I2CTargetApplet(GlasgowApplet):
     async def run(self, device, args):
         pulls = set()
         if args.pulls:
-            pulls = {args.pin_scl, args.pin_sda}
+            pulls = {args.scl, args.sda}
         iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args,
                                                            pull_high=pulls)
         return self.interface_cls(iface, self.logger)

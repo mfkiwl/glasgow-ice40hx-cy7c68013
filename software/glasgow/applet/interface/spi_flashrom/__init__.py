@@ -2,11 +2,11 @@ import logging
 import asyncio
 import enum
 from amaranth import *
+from amaranth.lib import io
 
 from ... import *
 from ....support.endpoint import *
 from ...interface.spi_controller import SPIControllerApplet
-from ...memory._25x import Memory25xSubtarget
 
 
 class SPISerprogInterface:
@@ -15,8 +15,9 @@ class SPISerprogInterface:
 
     async def write_read(self, sdata, rlen):
         assert len(sdata) > 0
-        await self.lower.write(sdata, hold_ss=rlen > 0)
-        return await self.lower.read(rlen)
+        async with self.lower.select():
+            await self.lower.write(sdata)
+            return await self.lower.read(rlen)
 
 
 class SerprogCommand(enum.IntEnum):
@@ -146,17 +147,40 @@ class SerprogCommandHandler:
             await self.nak()
 
 
+class SPIFlashromSubtarget(Elaboratable):
+    def __init__(self, controller, hold):
+        self.controller = controller
+        self.hold = hold
+
+    def elaborate(self, platform):
+        m = Module()
+
+        m.submodules.controller = self.controller
+        m.submodules.hold_buffer = hold = io.Buffer("o", self.hold)
+
+        m.d.comb += self.controller.bus.oe.eq(self.controller.bus.cs == 1)
+
+        if self.hold is not None:
+            m.d.comb += [
+                hold.oe.eq(1),
+                hold.o.eq(1),
+            ]
+
+        return m
+
+
 class SPIFlashromApplet(SPIControllerApplet):
     logger = logging.getLogger(__name__)
     help = "expose SPI via flashrom serprog interface"
     description = """
     Expose SPI via a socket using the flashrom serprog protocol; see https://www.flashrom.org.
+    This applet has the same default pin assignment as the `memory-25x` applet; See its description
+    for details.
 
     Usage:
 
     ::
-        glasgow run spi-flashrom -V 3.3 --pin-cs 0 --pin-cipo 1 --pin-copi 2 --pin-sck 3 \\
-            --freq 4000 tcp::2222
+        glasgow run spi-flashrom -V 3.3 --freq 4000 tcp::2222
         /sbin/flashrom -p serprog:ip=localhost:2222
 
     It is also possible to flash 25-series flash chips using the `memory-25x` applet, which does
@@ -169,20 +193,20 @@ class SPIFlashromApplet(SPIControllerApplet):
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access, omit_pins=True)
 
-        access.add_pin_argument(parser, "cs",   default=True, required=True)
-        access.add_pin_argument(parser, "cipo", default=True, required=True)
-        access.add_pin_argument(parser, "wp",   default=True)
-        access.add_pin_argument(parser, "copi", default=True, required=True)
-        access.add_pin_argument(parser, "sck",  default=True, required=True)
-        access.add_pin_argument(parser, "hold", default=True)
+        access.add_pins_argument(parser, "cs",   default="A5", required=True)
+        access.add_pins_argument(parser, "cipo", default="A4", required=True)
+        access.add_pins_argument(parser, "wp",   default="A3")
+        access.add_pins_argument(parser, "copi", default="A2", required=True)
+        access.add_pins_argument(parser, "sck",  default="A1", required=True)
+        access.add_pins_argument(parser, "hold", default="A0")
 
     def build_subtarget(self, target, args):
         subtarget = super().build_subtarget(target, args)
-        if args.pin_hold is not None:
-            hold_t = self.mux_interface.get_pin(args.pin_hold)
+        if args.hold is not None:
+            hold = self.mux_interface.get_port(args.hold, name="hold")
         else:
-            hold_t = None
-        return Memory25xSubtarget(subtarget, hold_t, args.cs_active)
+            hold = None
+        return SPIFlashromSubtarget(subtarget, hold)
 
     async def run(self, device, args):
         spi_iface = await self.run_lower(SPIFlashromApplet, device, args)
@@ -193,7 +217,8 @@ class SPIFlashromApplet(SPIControllerApplet):
         ServerEndpoint.add_argument(parser, "endpoint")
 
     async def interact(self, device, args, iface):
-        endpoint = await ServerEndpoint("socket", self.logger, args.endpoint)
+        endpoint = await ServerEndpoint("socket", self.logger, args.endpoint,
+            deprecated_cancel_on_eof=True)
         async def handle():
             while True:
                 try:

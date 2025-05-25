@@ -9,6 +9,7 @@ import argparse
 import struct
 from collections import namedtuple
 from amaranth import *
+from amaranth.lib import io
 from fx2.format import input_data, output_data
 
 from ....support.logging import dump_hex
@@ -51,23 +52,23 @@ FSR_BIT_RDISMB  = 0b00000100
 
 
 class ProgramNRF24Lx1Subtarget(Elaboratable):
-    def __init__(self, controller, prog_t, dut_prog, reset_t, dut_reset):
+    def __init__(self, controller, port_prog, dut_prog, port_reset, dut_reset):
         self.controller = controller
-        self.prog_t = prog_t
-        self.dut_prog = dut_prog
-        self.reset_t = reset_t
-        self.dut_reset = dut_reset
+        self.port_prog  = port_prog
+        self.dut_prog   = dut_prog
+        self.port_reset = port_reset
+        self.dut_reset  = dut_reset
 
     def elaborate(self, platform):
         m = Module()
 
         m.submodules.controller = self.controller
 
+        m.submodules.prog_buffer  = prog_buffer  = io.Buffer("o", self.port_prog)
+        m.submodules.reset_buffer = reset_buffer = io.Buffer("o", self.port_reset)
         m.d.comb += [
-            self.prog_t.o.eq(self.dut_prog),
-            self.prog_t.oe.eq(1),
-            self.reset_t.o.eq(~self.dut_reset),
-            self.reset_t.oe.eq(1),
+            prog_buffer.o.eq(self.dut_prog),
+            reset_buffer.o.eq(~self.dut_reset),
             self.controller.bus.oe.eq(self.dut_prog),
         ]
 
@@ -107,10 +108,10 @@ class ProgramNRF24Lx1Interface:
 
     async def _command(self, cmd, arg=[], ret=0):
         self._log("cmd=%02X arg=<%s> ret=%d", cmd, dump_hex(arg), ret)
-        await self.lower.write(bytearray([cmd, *arg]),
-                               hold_ss=(ret > 0))
-        if ret > 0:
+        async with self.lower.select():
+            await self.lower.write(bytes([cmd, *arg]))
             result = await self.lower.read(ret)
+        if ret > 0:
             self._log("res=<%s>", dump_hex(result))
             return result
 
@@ -179,19 +180,17 @@ class ProgramNRF24Lx1Applet(GlasgowApplet):
     Program the non-volatile memory of nRF24LE1 and nRF24LU1+ microcontrollers.
     """
 
-    __pins = ("prog", "sck", "copi", "cipo", "cs", "reset")
-
     @classmethod
     def add_build_arguments(cls, parser, access):
         access.add_build_arguments(parser)
 
         # Order matches the pin order, in clockwise direction.
-        access.add_pin_argument(parser, "prog",  default=True)
-        access.add_pin_argument(parser, "sck",   default=True)
-        access.add_pin_argument(parser, "copi",  default=True)
-        access.add_pin_argument(parser, "cipo",  default=True)
-        access.add_pin_argument(parser, "cs",    default=True)
-        access.add_pin_argument(parser, "reset", default=True)
+        access.add_pins_argument(parser, "prog",  default=True)
+        access.add_pins_argument(parser, "sck",   default=True)
+        access.add_pins_argument(parser, "copi",  default=True)
+        access.add_pins_argument(parser, "cipo",  default=True)
+        access.add_pins_argument(parser, "cs",    default=True)
+        access.add_pins_argument(parser, "reset", default=True)
 
         parser.add_argument(
             "-f", "--frequency", metavar="FREQ", type=int, default=1000,
@@ -202,20 +201,26 @@ class ProgramNRF24Lx1Applet(GlasgowApplet):
         dut_reset, self.__addr_dut_reset = target.registers.add_rw(1)
 
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
-        pads = iface.get_pads(args, pins=self.__pins)
+        ports = iface.get_port_group(
+            prog  = args.prog,
+            sck   = args.sck,
+            copi  = args.copi,
+            cipo  = args.cipo,
+            cs    = args.cs,
+            reset = args.reset
+        )
 
         controller = SPIControllerSubtarget(
-            pads=pads,
+            ports=ports,
             out_fifo=iface.get_out_fifo(),
             in_fifo=iface.get_in_fifo(auto_flush=True),
             period_cyc=math.ceil(target.sys_clk_freq / (args.frequency * 1000)),
             delay_cyc=math.ceil(target.sys_clk_freq / 1e6),
             sck_idle=0,
             sck_edge="rising",
-            cs_active=0,
         )
 
-        subtarget = ProgramNRF24Lx1Subtarget(controller, pads.prog_t, dut_prog, pads.reset_t, dut_reset)
+        subtarget = ProgramNRF24Lx1Subtarget(controller, ports.prog, dut_prog, ports.reset, dut_reset)
 
         return iface.add_subtarget(subtarget)
 

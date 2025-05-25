@@ -1,17 +1,12 @@
 import functools
-import os
 from amaranth import Elaboratable
 from amaranth.sim import Simulator
 
 
-__all__ = ["GatewareBuildError", "simulation_test"]
+__all__ = ["simulation_test"]
 
 
-class GatewareBuildError(Exception):
-    pass
-
-
-def simulation_test(case=None, **kwargs):
+def simulation_test(case=None, testbench=False, **kwargs):
     def configure_wrapper(case):
         @functools.wraps(case)
         def wrapper(self):
@@ -25,7 +20,10 @@ def simulation_test(case=None, **kwargs):
                 sim = Simulator(self.tb)
                 with sim.write_vcd("test.vcd"):
                     sim.add_clock(1e-8)
-                    sim.add_sync_process(setup_wrapper)
+                    if testbench:
+                        sim.add_testbench(setup_wrapper)
+                    else:
+                        sim.add_sync_process(setup_wrapper)
                     sim.run()
         return wrapper
 

@@ -4,6 +4,7 @@
 import math
 import logging
 from amaranth import *
+from amaranth.lib import io
 
 from ....interface.spi_controller import SPIControllerSubtarget, SPIControllerInterface
 from .... import *
@@ -11,20 +12,20 @@ from .. import *
 
 
 class ProgramAVRSPISubtarget(Elaboratable):
-    def __init__(self, controller, reset_t, dut_reset):
+    def __init__(self, controller, port_reset, dut_reset):
         self.controller = controller
-        self.reset_t = reset_t
+        self.port_reset = port_reset
         self.dut_reset = dut_reset
 
     def elaborate(self, platform):
         m = Module()
 
         m.submodules.controller = self.controller
+        m.submodules.reset_buffer = reset_buffer = io.Buffer("o", self.port_reset)
 
         m.d.comb += [
             self.controller.bus.oe.eq(self.dut_reset),
-            self.reset_t.oe.eq(1),
-            self.reset_t.o.eq(~self.dut_reset)
+            reset_buffer.o.eq(~self.dut_reset)
         ]
 
         return m
@@ -45,7 +46,7 @@ class ProgramAVRSPIInterface(ProgramAVRInterface):
     async def _command(self, byte1, byte2, byte3, byte4):
         command = [byte1, byte2, byte3, byte4]
         self._log("command %s", "{:08b} {:08b} {:08b} {:08b}".format(*command))
-        result = await self.lower.transfer(command)
+        result = await self.lower.exchange(command)
         self._log("result  %s", "{:08b} {:08b} {:08b} {:08b}".format(*result))
         return result
 
@@ -200,7 +201,7 @@ class ProgramAVRSPIInterface(ProgramAVRInterface):
 class ProgramAVRSPIApplet(ProgramAVRApplet):
     logger = logging.getLogger(__name__)
     help = f"{ProgramAVRApplet.help} via SPI"
-    description = """
+    description = f"""
     Identify, program, and verify Microchip AVR microcontrollers using low-voltage serial (SPI)
     programming.
 
@@ -213,18 +214,18 @@ class ProgramAVRSPIApplet(ProgramAVRApplet):
         CIPO @ * VCC
          SCK * * COPI
         RST# * * GND
-    """
 
-    __pins = ("reset", "sck", "cipo", "copi")
+    {ProgramAVRApplet.description}
+    """
 
     @classmethod
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
-        access.add_pin_argument(parser, "reset", default=True)
-        access.add_pin_argument(parser, "sck",   default=True)
-        access.add_pin_argument(parser, "cipo",  default=True)
-        access.add_pin_argument(parser, "copi",  default=True)
+        access.add_pins_argument(parser, "reset", default=True)
+        access.add_pins_argument(parser, "sck",   default=True)
+        access.add_pins_argument(parser, "cipo",  default=True)
+        access.add_pins_argument(parser, "copi",  default=True)
 
         parser.add_argument(
             "-f", "--frequency", metavar="FREQ", type=int, default=100,
@@ -232,21 +233,29 @@ class ProgramAVRSPIApplet(ProgramAVRApplet):
 
     def build(self, target, args):
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
+        ports=iface.get_port_group(
+                reset = args.reset,
+                sck   = args.sck,
+                cipo  = args.cipo,
+                copi  = args.copi
+            )
+
         controller = SPIControllerSubtarget(
-            pads=iface.get_pads(args, pins=self.__pins),
+            ports=ports,
             out_fifo=iface.get_out_fifo(),
             in_fifo=iface.get_in_fifo(auto_flush=False),
             period_cyc=math.ceil(target.sys_clk_freq / (args.frequency * 1000)),
             delay_cyc=math.ceil(target.sys_clk_freq / 1e6),
             sck_idle=0,
             sck_edge="rising",
-            cs_active=0,
         )
 
         dut_reset, self.__addr_dut_reset = target.registers.add_rw(1)
-        subtarget = ProgramAVRSPISubtarget(controller, iface.pads.reset_t, dut_reset)
-
-        iface.add_subtarget(subtarget)
+        return iface.add_subtarget(ProgramAVRSPISubtarget(
+            controller=controller,
+            port_reset=ports.reset,
+            dut_reset=dut_reset
+        ))
 
     async def run_lower(self, cls, device, args):
         iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args)

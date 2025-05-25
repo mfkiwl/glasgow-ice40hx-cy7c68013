@@ -1,17 +1,24 @@
-import os, time
+import sys, os, os.path
 is_production = True if os.getenv("DOCS_IS_PRODUCTION", "").lower() in ('1', 'yes', 'true') else False
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "..", "..", "software"))
+import glasgow
 
 html_title = project = "Glasgow Interface\u00a0Explorer"
 release = version = ""
-copyright = time.strftime("2020—%Y, Glasgow Interface Explorer contributors")
+copyright = "2020—%Y, Glasgow Interface Explorer contributors"
 
 extensions = [
     "myst_parser",
     "sphinx.ext.todo",
     "sphinx.ext.intersphinx",
+    "sphinx.ext.autodoc",
     "sphinx_copybutton",
     "sphinx_inline_tabs",
+    "sphinxcontrib.autoprogram",
 ]
+
+highlight_language = "text"
 
 todo_include_todos = True
 todo_emit_warnings = True
@@ -27,6 +34,7 @@ html_use_index = False
 
 html_theme = "furo"
 html_baseurl = "https://glasgow-embedded.org/latest/"
+html_static_path = ["_static"]
 html_css_files = [
       "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/fontawesome.min.css",
       "https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.0.0/css/solid.min.css",
@@ -79,11 +87,17 @@ linkcheck_ignore = [
     r"^http://127\.0\.0\.1:8000$",
     # Doesn't like the linkcheck User-Agent.
     r"^https://mouser\.com/",
+    # For unknown reasons, is (mostly) unreachable from GitHub CI runners.
+    r"^https://chaos\.social/",
+    # As above.
+    r"^https://en\.uesp\.net/",
+    # As above.
+    r"^https://www\.gnu\.org/",
 ]
 
 linkcheck_anchors_ignore_for_url = [
     r"^https://matrix\.to/",
     r"^https://web\.libera\.chat/",
-    # React page with README content included as a JSON payload.
-    r"^https://github\.com/[^/]+/[^/]+/$",
+    # GitHub is a React-based SPA; even README content is included as a JSON payload.
+    r"^https://github\.com/",
 ]

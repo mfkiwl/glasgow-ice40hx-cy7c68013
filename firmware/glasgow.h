@@ -28,7 +28,7 @@ enum {
 
 enum {
   // API compatibility level
-  CUR_API_LEVEL  = 0x02,
+  CUR_API_LEVEL  = 0x04,
 };
 
 // PORTA pins
@@ -48,6 +48,30 @@ enum {
 #define PIND_LED_ERR          5
 #define PIND_ENVB             6
 #define PIND_OEQ_N_REVAB      7
+
+// Set up aliases for all of the GPIO pins accessible by `setb` and `clr`
+// to reduce code size.
+#define CONCAT(a, b) a ## b
+#define IO_A(number) CONCAT(PA, number)
+#define IO_B(number) CONCAT(PB, number)
+#define IO_D(number) CONCAT(PD, number)
+
+#define IO_ALERT_N        IO_A(PINA_ALERT_N)
+#define IO_CDONE          IO_A(PINA_CDONE)
+#define IO_CRESET_N_REVC  IO_A(PINA_CRESET_N_REVC)
+
+#define IO_SI             IO_B(PINB_SI)
+#define IO_SS_N           IO_B(PINB_SS_N)
+#define IO_SCK            IO_B(PINB_SCK)
+
+#define IO_ENVA           IO_D(PIND_ENVA)
+#define IO_CRESET_N_REVAB IO_D(PIND_CRESET_N_REVAB)
+#define IO_LED_FX2        IO_D(PIND_LED_FX2)
+#define IO_LED_ICE        IO_D(PIND_LED_ICE)
+#define IO_LED_ACT        IO_D(PIND_LED_ACT)
+#define IO_LED_ERR        IO_D(PIND_LED_ERR)
+#define IO_ENVB           IO_D(PIND_ENVB)
+#define IO_OEQ_N_REVAB    IO_D(PIND_OEQ_N_REVAB)
 
 enum {
   // I2C addresses (unshifted)
@@ -76,6 +100,12 @@ enum {
 // I/O buffer parameters
 #define MIN_VOLTAGE 1650 // mV
 #define MAX_VOLTAGE 5500 // mV
+
+// FPGA registers
+enum {
+  FPGA_REG_HEALTH   = 0x00,
+  FPGA_REG_PIPE_RST = 0x01,
+};
 
 // Config API
 enum {
@@ -114,6 +144,12 @@ bool fpga_is_ready();
 bool fpga_reg_select(uint8_t addr);
 bool fpga_reg_read(__xdata uint8_t *value, uint8_t length);
 bool fpga_reg_write(__xdata const uint8_t *value, uint8_t length);
+bool fpga_pipe_rst(uint8_t set, uint8_t clr);
+
+// FIFO API
+void fifo_init();
+void fifo_configure(bool two_ep);
+void fifo_reset(bool two_ep, uint8_t ep_mask);
 
 // DAC/LDO API
 void iobuf_init_dac_ldo();
@@ -152,15 +188,8 @@ void iobuf_read_alert_cache_ina233(__xdata uint8_t *mask, bool clear);
 bool iobuf_set_pull(uint8_t selector, uint8_t enable, uint8_t level);
 bool iobuf_get_pull(uint8_t selector, __xdata uint8_t *enable, __xdata uint8_t *level);
 
-// FIFO API
-void fifo_init();
-void fifo_configure(bool two_ep);
-void fifo_reset(bool two_ep, uint8_t interfaces);
-
 // Util functions
-bool i2c_reg8_read(uint8_t addr, uint8_t reg,
-                         __pdata uint8_t *value, uint8_t length);
-bool i2c_reg8_write(uint8_t addr, uint8_t reg,
-                          __pdata const uint8_t *value, uint8_t length);
+bool i2c_reg8_read(uint8_t addr, uint8_t reg, __pdata uint8_t *value, uint8_t length);
+bool i2c_reg8_write(uint8_t addr, uint8_t reg, __pdata const uint8_t *value, uint8_t length);
 
 #endif

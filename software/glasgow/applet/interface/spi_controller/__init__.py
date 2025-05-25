@@ -1,7 +1,9 @@
+import math
 import struct
 import logging
-import math
+import contextlib
 from amaranth import *
+from amaranth.lib import io
 from amaranth.lib.cdc import FFSynchronizer
 
 from ....support.logging import *
@@ -10,16 +12,15 @@ from ... import *
 
 
 class SPIControllerBus(Elaboratable):
-    def __init__(self, pads, sck_idle, sck_edge, cs_active):
-        self.pads = pads
+    def __init__(self, ports, sck_idle, sck_edge):
+        self.ports = ports
         self.sck_idle = sck_idle
         self.sck_edge = sck_edge
-        self.cs_active = cs_active
 
         self.oe   = Signal(init=1)
 
         self.sck  = Signal(init=sck_idle)
-        self.cs   = Signal(init=not cs_active)
+        self.cs   = Signal()
         self.copi = Signal()
         self.cipo = Signal()
 
@@ -29,22 +30,30 @@ class SPIControllerBus(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        m.submodules.sck_buffer = sck_buffer = io.Buffer("o", self.ports.sck)
+
         m.d.comb += [
-            self.pads.sck_t.oe.eq(self.oe),
-            self.pads.sck_t.o.eq(self.sck),
+            sck_buffer.oe.eq(self.oe),
+            sck_buffer.o.eq(self.sck),
         ]
-        if hasattr(self.pads, "cs_t"):
-            m.d.comb += [
-                self.pads.cs_t.oe.eq(1),
-                self.pads.cs_t.o.eq(self.cs),
-            ]
-        if hasattr(self.pads, "copi_t"):
-            m.d.comb += [
-                self.pads.copi_t.oe.eq(self.oe),
-                self.pads.copi_t.o.eq(self.copi)
-            ]
-        if hasattr(self.pads, "cipo_t"):
-            m.submodules += FFSynchronizer(self.pads.cipo_t.i, self.cipo)
+
+        if hasattr(self.ports, "cs"):
+            if self.ports.cs is not None:
+                m.submodules.cs_buffer = cs_buffer = io.Buffer("o", self.ports.cs)
+                m.d.comb += cs_buffer.o.eq(~self.cs),
+
+        if hasattr(self.ports, "copi"):
+            if self.ports.copi is not None:
+                m.submodules.copi_buffer = copi_buffer = io.Buffer("o", self.ports.copi)
+                m.d.comb += [
+                    copi_buffer.oe.eq(self.oe),
+                    copi_buffer.o.eq(self.copi)
+                ]
+
+        if hasattr(self.ports, "cipo"):
+            if self.ports.cipo is not None:
+                m.submodules.cipo_buffer = cipo_buffer = io.Buffer("i", self.ports.cipo)
+                m.submodules += FFSynchronizer(cipo_buffer.i, self.cipo)
 
         sck_r = Signal()
         m.d.sync += sck_r.eq(self.sck)
@@ -66,26 +75,25 @@ class SPIControllerBus(Elaboratable):
 
 
 CMD_MASK     = 0b11110000
-CMD_SHIFT    = 0b00000000
-CMD_DELAY    = 0b00010000
-CMD_SYNC     = 0b00100000
+CMD_SELECT   = 0b00000000
+CMD_SHIFT    = 0b00010000
+CMD_DELAY    = 0b00100000
+CMD_SYNC     = 0b00110000
 # CMD_SHIFT
 BIT_DATA_OUT =     0b0001
 BIT_DATA_IN  =     0b0010
-BIT_HOLD_SS  =     0b0100
 
 
 class SPIControllerSubtarget(Elaboratable):
-    def __init__(self, pads, out_fifo, in_fifo, period_cyc, delay_cyc,
-                 sck_idle, sck_edge, cs_active):
-        self.pads = pads
+    def __init__(self, ports, out_fifo, in_fifo, period_cyc, delay_cyc,
+                 sck_idle, sck_edge):
+        self.ports = ports
         self.out_fifo = out_fifo
         self.in_fifo = in_fifo
         self.period_cyc = period_cyc
         self.delay_cyc = delay_cyc
-        self.cs_active = cs_active
 
-        self.bus = SPIControllerBus(pads, sck_idle, sck_edge, cs_active)
+        self.bus = SPIControllerBus(ports, sck_idle, sck_edge)
 
     def elaborate(self, platform):
         m = Module()
@@ -127,7 +135,9 @@ class SPIControllerSubtarget(Elaboratable):
                 with m.If(self.out_fifo.r_rdy):
                     m.d.comb += self.out_fifo.r_en.eq(1)
                     m.d.sync += cmd.eq(self.out_fifo.r_data)
-                    with m.If((self.out_fifo.r_data & CMD_MASK) == CMD_SYNC):
+                    with m.If((self.out_fifo.r_data & CMD_MASK) == CMD_SELECT):
+                        m.d.sync += self.bus.cs.eq(self.out_fifo.r_data[0])
+                    with m.Elif((self.out_fifo.r_data & CMD_MASK) == CMD_SYNC):
                         m.next = "SYNC"
                     with m.Else():
                         m.next = "RECV-COUNT-1"
@@ -166,10 +176,7 @@ class SPIControllerSubtarget(Elaboratable):
             with m.State("COUNT-CHECK"):
                 with m.If(count == 0):
                     m.next = "RECV-COMMAND"
-                    with m.If((cmd & BIT_HOLD_SS) != 0):
-                        m.d.sync += self.bus.cs.eq(self.cs_active)
                 with m.Else():
-                    m.d.sync += self.bus.cs.eq(self.cs_active)
                     m.next = "RECV-DATA"
 
             with m.State("RECV-DATA"):
@@ -203,8 +210,6 @@ class SPIControllerSubtarget(Elaboratable):
 
                 with m.If(((cmd & BIT_DATA_OUT) != 0) | self.in_fifo.w_rdy):
                     with m.If(count == 0):
-                        with m.If((cmd & BIT_HOLD_SS) == 0):
-                            m.d.sync += self.bus.cs.eq(not self.cs_active)
                         m.next = "RECV-COMMAND"
                     with m.Else():
                         m.next = "RECV-DATA"
@@ -217,6 +222,7 @@ class SPIControllerInterface:
         self.lower   = interface
         self._logger = logger
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
+        self._active = None
 
     def _log(self, message, *args):
         self._logger.log(self._level, "SPI: " + message, *args)
@@ -226,74 +232,83 @@ class SPIControllerInterface:
         await self.lower.reset()
 
     @staticmethod
-    def _chunk_count(count, hold_ss, chunk_size=0xffff):
-        while count > chunk_size:
-            yield chunk_size, True
-            count -= chunk_size
-        yield count, hold_ss
+    def _chunked(items, *, count=0xffff):
+        while items:
+            yield items[:count]
+            items = items[count:]
 
-    @staticmethod
-    def _chunk_bytes(bytes, hold_ss, chunk_size=0xffff):
-        offset = 0
-        while len(bytes) - offset > chunk_size:
-            yield bytes[offset:offset + chunk_size], True
-            offset += chunk_size
-        yield bytes[offset:], hold_ss
-
-    async def transfer(self, data, hold_ss=False):
+    @contextlib.asynccontextmanager
+    async def select(self, index=0):
+        assert self._active is None, "chip already selected"
+        assert index == 0, "only one chip is supported"
         try:
-            out_data = memoryview(data)
-        except TypeError:
-            out_data = memoryview(bytes(data))
-        self._log("xfer-out=<%s>", dump_hex(out_data))
-        in_data = []
-        for out_data, hold_ss in self._chunk_bytes(out_data, hold_ss):
+            self._log("select chip=%d", index)
+            await self.lower.write(struct.pack("<B",
+                CMD_SELECT|(1 + index)))
+            self._active = index
+            yield
+        finally:
+            self._log("deselect")
+            await self.lower.write(struct.pack("<B",
+                CMD_SELECT|0))
+            await self.lower.flush()
+            self._active = None
+
+    async def exchange(self, octets):
+        assert self._active is not None, "no chip selected"
+        self._log("xchg-o=<%s>", dump_hex(octets))
+        for chunk in self._chunked(octets):
             await self.lower.write(struct.pack("<BH",
-                CMD_SHIFT|BIT_DATA_IN|BIT_DATA_OUT|(BIT_HOLD_SS if hold_ss else 0),
-                len(out_data)))
-            await self.lower.write(out_data)
-            in_data.append(await self.lower.read(len(out_data)))
-        in_data = b"".join(in_data)
-        self._log("xfer-in=<%s>", dump_hex(in_data))
-        return in_data
+                CMD_SHIFT|BIT_DATA_IN|BIT_DATA_OUT, len(chunk)))
+            await self.lower.write(chunk)
+        octets = await self.lower.read(len(octets))
+        self._log("xchg-i=<%s>", dump_hex(octets))
+        return octets
 
-    async def read(self, count, hold_ss=False):
-        in_data = []
-        for count, hold_ss in self._chunk_count(count, hold_ss):
+    async def write(self, octets, *, x=1):
+        assert self._active is not None, "no chip selected"
+        assert x == 1, "only x1 mode is supported"
+        self._log("write=<%s>", dump_hex(octets))
+        for chunk in self._chunked(octets):
             await self.lower.write(struct.pack("<BH",
-                CMD_SHIFT|BIT_DATA_IN|(BIT_HOLD_SS if hold_ss else 0),
-                count))
-            in_data.append(await self.lower.read(count))
-        in_data = b"".join(in_data)
-        self._log("read-in=<%s>", dump_hex(in_data))
-        return in_data
+                CMD_SHIFT|BIT_DATA_OUT, len(chunk)))
+            await self.lower.write(chunk)
 
-    async def write(self, data, hold_ss=False):
-        try:
-            out_data = memoryview(data)
-        except TypeError:
-            out_data = memoryview(bytes(data))
-        self._log("write-out=<%s>", dump_hex(out_data))
-        for out_data, hold_ss in self._chunk_bytes(out_data, hold_ss):
+    async def read(self, count, *, x=1):
+        assert self._active is not None, "no chip selected"
+        assert x == 1, "only x1 mode is supported"
+        for chunk in self._chunked(range(count)):
             await self.lower.write(struct.pack("<BH",
-                CMD_SHIFT|BIT_DATA_OUT|(BIT_HOLD_SS if hold_ss else 0),
-                len(out_data)))
-            await self.lower.write(out_data)
+                CMD_SHIFT|BIT_DATA_IN, len(chunk)))
+        octets = await self.lower.read(count)
+        self._log("read=<%s>", dump_hex(octets))
+        return octets
 
-    async def delay_us(self, delay):
-        self._log("delay=%d us", delay)
-        while delay > 0xffff:
-            await self.lower.write(struct.pack("<BH", CMD_DELAY, 0xffff))
-            delay -= 0xffff
-        await self.lower.write(struct.pack("<BH", CMD_DELAY, delay))
+    async def dummy(self, count):
+        # We intentionally allow sending dummy cycles with no chip selected.
+        self._log("dummy=%d", count)
+        for chunk in self._chunked(range(count)):
+            assert count % 8 == 0, "only multiples of 8 dummy cycles are supported"
+            await self.lower.write(struct.pack("<BH",
+                CMD_SHIFT, len(chunk) // 8))
 
-    async def delay_ms(self, delay):
-        await self.delay_us(delay * 1000)
+    async def delay_us(self, duration):
+        self._log("delay us=%d", duration)
+        for chunk in self._chunked(range(duration)):
+            await self.lower.write(struct.pack("<BH",
+                CMD_DELAY, len(chunk)))
+
+    async def delay_ms(self, duration):
+        self._log("delay ms=%d", duration)
+        for chunk in self._chunked(range(duration * 1000)):
+            await self.lower.write(struct.pack("<BH",
+                CMD_DELAY, len(chunk)))
 
     async def synchronize(self):
-        self._log("sync")
+        self._log("sync-o")
         await self.lower.write([CMD_SYNC])
         await self.lower.read(1)
+        self._log("sync-i")
 
 
 class SPIControllerApplet(GlasgowApplet):
@@ -303,17 +318,15 @@ class SPIControllerApplet(GlasgowApplet):
     Initiate transactions on the SPI bus.
     """
 
-    __pins = ("sck", "cs", "copi", "cipo")
-
     @classmethod
     def add_build_arguments(cls, parser, access, omit_pins=False):
         super().add_build_arguments(parser, access)
 
         if not omit_pins:
-            access.add_pin_argument(parser, "sck", required=True)
-            access.add_pin_argument(parser, "cs")
-            access.add_pin_argument(parser, "copi")
-            access.add_pin_argument(parser, "cipo")
+            access.add_pins_argument(parser, "sck", required=True)
+            access.add_pins_argument(parser, "cs")
+            access.add_pins_argument(parser, "copi")
+            access.add_pins_argument(parser, "cipo")
 
         parser.add_argument(
             "-f", "--frequency", metavar="FREQ", type=int, default=100,
@@ -325,14 +338,16 @@ class SPIControllerApplet(GlasgowApplet):
             "--sck-edge", metavar="EDGE", type=str, choices=["r", "rising", "f", "falling"],
             default="rising",
             help="latch data at clock edge EDGE (default: %(default)s)")
-        parser.add_argument(
-            "--cs-active", metavar="LEVEL", type=int, choices=[0, 1], default=0,
-            help="set active chip select level to LEVEL (default: %(default)s)")
 
-    def build_subtarget(self, target, args, pins=__pins):
+    def build_subtarget(self, target, args):
         iface = self.mux_interface
         return SPIControllerSubtarget(
-            pads=iface.get_pads(args, pins=pins),
+            ports=iface.get_port_group(
+                sck  = args.sck,
+                cs   = args.cs if hasattr(args, "cs") else None,
+                copi = args.copi if hasattr(args, "copi") else None,
+                cipo = args.cipo if hasattr(args, "cipo") else None
+            ),
             out_fifo=iface.get_out_fifo(),
             in_fifo=iface.get_in_fifo(auto_flush=False),
             period_cyc=self.derive_clock(input_hz=target.sys_clk_freq,
@@ -346,7 +361,6 @@ class SPIControllerApplet(GlasgowApplet):
                                         clock_name="delay"),
             sck_idle=args.sck_idle,
             sck_edge=args.sck_edge,
-            cs_active=args.cs_active,
         )
 
     def build(self, target, args):
@@ -364,12 +378,14 @@ class SPIControllerApplet(GlasgowApplet):
         def hex(arg): return bytes.fromhex(arg)
 
         parser.add_argument(
-            "data", metavar="DATA", type=hex,
-            help="hex bytes to transfer to the device")
+            "data", metavar="DATA", type=hex, nargs="+",
+            help="hex bytes to exchange with the device")
 
     async def interact(self, device, args, spi_iface):
-        data = await spi_iface.transfer(args.data)
-        print(data.hex())
+        for octets in args.data:
+            async with spi_iface.select():
+                octets = await spi_iface.exchange(octets)
+            print(octets.hex())
 
     @classmethod
     def tests(cls):

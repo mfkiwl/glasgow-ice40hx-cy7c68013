@@ -14,7 +14,7 @@ import argparse
 import logging
 import asyncio
 from amaranth import *
-from amaranth.lib.cdc import FFSynchronizer
+from amaranth.lib import io, cdc
 
 from ... import *
 
@@ -61,8 +61,8 @@ CMD_DDRAM_ADDRESS  = 0b10000000
 
 
 class HD44780Subtarget(Elaboratable):
-    def __init__(self, pads, out_fifo, in_fifo, sys_clk_freq):
-        self.pads = pads
+    def __init__(self, ports, out_fifo, in_fifo, sys_clk_freq):
+        self.ports = ports
         self.out_fifo = out_fifo
         self.in_fifo = in_fifo
         self.sys_clk_freq = sys_clk_freq
@@ -72,13 +72,12 @@ class HD44780Subtarget(Elaboratable):
 
         di = Signal(4)
 
-        m.d.comb += [
-            self.pads.rs_t.oe.eq(1),
-            self.pads.rw_t.oe.eq(1),
-            self.pads.e_t.oe.eq(1),
-            self.pads.d_t.oe.eq(~self.pads.rw_t.o),
-        ]
-        m.submodules += FFSynchronizer(self.pads.d_t.i, di)
+        m.submodules.rs_buffer = rs_buffer = io.Buffer("o", self.ports.rs)
+        m.submodules.rw_buffer = rw_buffer = io.Buffer("o", self.ports.rw)
+        m.submodules.e_buffer = e_buffer = io.Buffer("o", self.ports.e)
+        m.submodules.d_buffer = d_buffer = io.Buffer("io", self.ports.d)
+        m.d.comb += d_buffer.oe.eq(~rw_buffer.o),
+        m.submodules += cdc.FFSynchronizer(d_buffer.i, di)
 
         rx_setup_cyc = math.ceil(60e-9 * self.sys_clk_freq)
         e_pulse_cyc  = math.ceil(500e-9 * self.sys_clk_freq)
@@ -93,7 +92,7 @@ class HD44780Subtarget(Elaboratable):
 
         with m.FSM() as fsm:
             with m.State("IDLE"):
-                m.d.sync += self.pads.e_t.o.eq(0)
+                m.d.sync += e_buffer.o.eq(0)
                 m.d.comb += self.out_fifo.r_en.eq(1)
                 with m.If(self.out_fifo.r_rdy):
                     m.d.sync += cmd.eq(self.out_fifo.r_data)
@@ -102,8 +101,8 @@ class HD44780Subtarget(Elaboratable):
             with m.State("COMMAND"):
                 m.d.sync += [
                     msb.eq((cmd & XFER_BIT_HALF) == 0),
-                    self.pads.rs_t.o.eq((cmd & XFER_BIT_DATA) != 0),
-                    self.pads.rw_t.o.eq((cmd & XFER_BIT_READ) != 0),
+                    rs_buffer.o.eq((cmd & XFER_BIT_DATA) != 0),
+                    rw_buffer.o.eq((cmd & XFER_BIT_READ) != 0),
                 ]
                 with m.If(cmd & XFER_BIT_WAIT):
                     m.d.sync += timer.eq(cmd_wait_cyc)
@@ -120,8 +119,8 @@ class HD44780Subtarget(Elaboratable):
             with m.State("WRITE"):
                 with m.If(timer == 0):
                     m.d.sync += [
-                        self.pads.e_t.o.eq(1),
-                        self.pads.d_t.o.eq(Mux(msb, wdata[4:], wdata[:4])),
+                        e_buffer.o.eq(1),
+                        d_buffer.o.eq(Mux(msb, wdata[4:], wdata[:4])),
                         timer.eq(e_pulse_cyc),
                     ]
                     m.next = "WRITE-HOLD"
@@ -131,7 +130,7 @@ class HD44780Subtarget(Elaboratable):
             with m.State("WRITE-HOLD"):
                 with m.If(timer == 0):
                     m.d.sync += [
-                        self.pads.e_t.o.eq(0),
+                        e_buffer.o.eq(0),
                         msb.eq(0),
                         timer.eq(e_wait_cyc),
                     ]
@@ -145,7 +144,7 @@ class HD44780Subtarget(Elaboratable):
             with m.State("READ-SETUP"):
                 with m.If(timer == 0):
                     m.d.sync += [
-                        self.pads.e_t.o.eq(1),
+                        e_buffer.o.eq(1),
                         timer.eq(e_pulse_cyc),
                     ]
                     m.next = "READ"
@@ -159,7 +158,7 @@ class HD44780Subtarget(Elaboratable):
                         pass
                     with m.Else():
                         m.d.sync += [
-                            self.pads.e_t.o.eq(0),
+                            e_buffer.o.eq(0),
                             msb.eq(0),
                             timer.eq(e_wait_cyc),
                         ]
@@ -210,15 +209,20 @@ class DisplayHD44780Applet(GlasgowApplet):
     @classmethod
     def add_build_arguments(cls, parser, access):
         access.add_build_arguments(parser)
-        access.add_pin_argument(parser, "rs", default=True)
-        access.add_pin_argument(parser, "rw", default=True)
-        access.add_pin_argument(parser, "e", default=True)
-        access.add_pin_set_argument(parser, "d", width=4, default=True)
+        access.add_pins_argument(parser, "rs", default=True)
+        access.add_pins_argument(parser, "rw", default=True)
+        access.add_pins_argument(parser, "e", default=True)
+        access.add_pins_argument(parser, "d", width=4, default=True)
 
     def build(self, target, args):
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
         iface.add_subtarget(HD44780Subtarget(
-            pads=iface.get_pads(args, pins=("rs", "rw", "e"), pin_sets=("d",)),
+            ports=iface.get_port_group(
+                rs=args.rs,
+                rw=args.rw,
+                e=args.e,
+                d=args.d,
+            ),
             out_fifo=iface.get_out_fifo(),
             in_fifo=iface.get_in_fifo(),
             sys_clk_freq=target.sys_clk_freq,
@@ -234,9 +238,9 @@ class DisplayHD44780Applet(GlasgowApplet):
         iface = await device.demultiplexer.claim_interface(self, self.mux_interface, args=None)
 
         if args.reset:
-            await device.set_voltage(args.port_spec, 0.0)
+            await device.set_voltage("AB", 0.0)
             await asyncio.sleep(0.3)
-        await device.set_voltage(args.port_spec, 5.0)
+        await device.set_voltage("AB", 5.0)
         await asyncio.sleep(0.040) # wait 40ms after reset
 
         # TODO: abstract this away into a HD44780Interface

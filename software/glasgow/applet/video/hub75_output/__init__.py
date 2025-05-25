@@ -1,17 +1,18 @@
 import argparse
 import logging
 from amaranth import *
+from amaranth.lib import io
 
 from ... import *
 
 
 class VideoHub75Output(Elaboratable):
-    def __init__(self, pads):
-        self.pads = pads
+    def __init__(self, ports):
+        self.ports = ports
 
-        self.rgb1 = Signal(pads.rgb1_t.o.shape())
-        self.rgb2 = Signal(pads.rgb2_t.o.shape())
-        self.addr = Signal(pads.addr_t.o.shape())
+        self.rgb1 = Signal(len(self.ports.rgb1))
+        self.rgb2 = Signal(len(self.ports.rgb2))
+        self.addr = Signal(len(self.ports.addr))
         self.clk  = Signal()
         self.lat  = Signal()
         self.oe   = Signal()
@@ -19,32 +20,28 @@ class VideoHub75Output(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
+        m.submodules.rgb1_buffer = rgb1_buffer = io.Buffer("o", self.ports.rgb1)
+        m.submodules.rgb2_buffer = rgb2_buffer = io.Buffer("o", self.ports.rgb2)
+        m.submodules.addr_buffer = addr_buffer = io.Buffer("o", self.ports.addr)
+        m.submodules.clk_buffer  = clk_buffer  = io.Buffer("o", self.ports.clk)
+        m.submodules.lat_buffer  = lat_buffer  = io.Buffer("o", self.ports.lat)
+        m.submodules.oe_buffer   = oe_buffer   = io.Buffer("o", self.ports.oe)
+
         m.d.comb += [
-            self.pads.rgb1_t.oe.eq(1),
-            self.pads.rgb1_t.o.eq(self.rgb1),
-
-            self.pads.rgb2_t.oe.eq(1),
-            self.pads.rgb2_t.o.eq(self.rgb2),
-
-            self.pads.addr_t.oe.eq(1),
-            self.pads.addr_t.o.eq(self.addr),
-
-            self.pads.clk_t.oe.eq(1),
-            self.pads.clk_t.o.eq(self.clk),
-
-            self.pads.lat_t.oe.eq(1),
-            self.pads.lat_t.o.eq(self.lat),
-
-            self.pads.oe_t.oe.eq(1),
-            self.pads.oe_t.o.eq(~self.oe),
+            rgb1_buffer.o.eq(self.rgb1),
+            rgb2_buffer.o.eq(self.rgb2),
+            addr_buffer.o.eq(self.addr),
+            clk_buffer.o.eq(self.clk),
+            lat_buffer.o.eq(self.lat),
+            oe_buffer.o.eq(~self.oe),
         ]
 
         return m
 
 
 class VideoHub75OutputSubtarget(Elaboratable):
-    def __init__(self, pads, px_width, px_height, expose_delay, pattern_rate):
-        self.pads = pads
+    def __init__(self, ports, px_width, px_height, expose_delay, pattern_rate):
+        self.ports = ports
 
         self.px_width = px_width
         self.px_height = px_height
@@ -59,7 +56,7 @@ class VideoHub75OutputSubtarget(Elaboratable):
 
         m = Module()
 
-        m.submodules.output = output = VideoHub75Output(self.pads)
+        m.submodules.output = output = VideoHub75Output(self.ports)
 
         row      = Signal(output.addr.shape())
         row_disp = Signal(output.addr.shape())
@@ -115,19 +112,16 @@ class VideoHub75OutputApplet(GlasgowApplet):
     Using a vertical resolution that does not match your display will cause the image to split.
     """
 
-    __pin_sets = ("rgb1", "rgb2", "addr")
-    __pins = ("clk", "lat", "oe")
-
     @classmethod
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
-        access.add_pin_set_argument(parser, "rgb1", width=3,          default=(0,1,2))
-        access.add_pin_set_argument(parser, "rgb2", width=3,          default=(3,4,5))
-        access.add_pin_set_argument(parser, "addr", width=range(1,6), default=(8,9,10,11,12))
-        access.add_pin_argument(parser,     "clk",                    default=13)
-        access.add_pin_argument(parser,     "lat",                    default=14)
-        access.add_pin_argument(parser,     "oe",                     default=15)
+        access.add_pins_argument(parser, "rgb1", width=3,          default="A0:2")
+        access.add_pins_argument(parser, "rgb2", width=3,          default="A3:5")
+        access.add_pins_argument(parser, "addr", width=range(1,6), default="B0:4")
+        access.add_pins_argument(parser, "clk",                    default="B5")
+        access.add_pins_argument(parser, "lat",                    default="B6")
+        access.add_pins_argument(parser, "oe",                     default="B7")
 
         parser.add_argument(
             "--px-width", metavar="PX-WIDTH", type=int, default=64,
@@ -143,7 +137,7 @@ class VideoHub75OutputApplet(GlasgowApplet):
             help="the exposure delay, directly impacts brightness and refresh rate (default: %(default)s)")
 
     def build(self, target, args):
-        num_addr_bits = len(args.pin_set_addr)
+        num_addr_bits = len(args.addr)
         max_px_height = pow(2, num_addr_bits) * 2
         if args.px_height > max_px_height:
             raise GlasgowAppletError("Cannot have a vertical panel resolution of {} with only {} address bits..."
@@ -151,7 +145,14 @@ class VideoHub75OutputApplet(GlasgowApplet):
 
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
         subtarget = iface.add_subtarget(VideoHub75OutputSubtarget(
-            pads=iface.get_pads(args, pins=self.__pins, pin_sets=self.__pin_sets),
+            ports=iface.get_port_group(
+                rgb1 = args.rgb1,
+                rgb2 = args.rgb2,
+                addr = args.addr,
+                clk  = args.clk,
+                lat  = args.lat,
+                oe   = args.oe
+            ),
             px_width=args.px_width,
             px_height=args.px_height,
             expose_delay=args.expose_delay,

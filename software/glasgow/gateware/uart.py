@@ -1,4 +1,5 @@
 from amaranth import *
+from amaranth.lib import io
 from amaranth.lib.cdc import FFSynchronizer
 
 
@@ -11,35 +12,30 @@ class UARTBus(Elaboratable):
 
     Provides synchronization.
     """
-    def __init__(self, pads, invert_rx, invert_tx):
-        self.invert_rx = invert_rx
-        self.invert_tx = invert_tx
-
-        self.has_rx = hasattr(pads, "rx_t")
-        if self.has_rx:
-            self.rx_t = pads.rx_t
-            self.rx_i = Signal()
-
-        self.has_tx = hasattr(pads, "tx_t")
-        if self.has_tx:
-            self.tx_t = pads.tx_t
-            self.tx_o = Signal(init=1)
+    def __init__(self, ports):
+        self.ports = ports
+        
+        self.has_rx = self.has_tx = False
+        if hasattr(ports, "rx"):
+            if ports.rx is not None:
+                self.has_rx = True
+                self.rx_i = Signal()
+        
+        if hasattr(ports, "tx"):
+            if ports.tx is not None:
+                self.has_tx = True
+                self.tx_o = Signal(init=1)
 
     def elaborate(self, platform):
         m = Module()
 
         if self.has_tx:
-            m.d.comb += self.tx_t.oe.eq(1)
-            if self.invert_tx:
-                m.d.comb += self.tx_t.o.eq(~self.tx_o)
-            else:
-                m.d.comb += self.tx_t.o.eq(self.tx_o)
+            m.submodules.tx_buffer = tx_buffer = io.Buffer("o", self.ports.tx)
+            m.d.comb += tx_buffer.o.eq(self.tx_o)
 
         if self.has_rx:
-            if self.invert_rx:
-                m.submodules += FFSynchronizer(~self.rx_t.i, self.rx_i, init=1)
-            else:
-                m.submodules += FFSynchronizer(self.rx_t.i, self.rx_i, init=1)
+            m.submodules.rx_buffer = rx_buffer = io.Buffer("i", self.ports.rx)
+            m.submodules += FFSynchronizer(rx_buffer.i, self.rx_i, init=1)
 
         return m
 
@@ -63,12 +59,6 @@ class UART(Elaboratable):
     :type max_bit_cyc: int
     :param max_bit_cyc:
         Maximum possible value for ``bit_cyc`` that can be configured at runtime.
-    :type invert_rx: bool
-    :param invert_rx:
-        Invert the line signal (=idle low) for RX
-    :type invert_tx: bool
-    :param invert_tx:
-        Invert the line signal (=idle low) for TX
 
     :attr bit_cyc:
         Register with the current value for bit time, minus one.
@@ -100,8 +90,7 @@ class UART(Elaboratable):
         Transmit acknowledgement. If active when ``tx_rdy`` is active, ``tx_rdy`` is reset,
         ``tx_data`` is sampled, and the transmit state machine starts transmitting a frame.
     """
-    def __init__(self, pads, bit_cyc, data_bits=8, parity="none", max_bit_cyc=None,
-                 invert_rx=False, invert_tx=False):
+    def __init__(self, ports, bit_cyc, data_bits=8, parity="none", max_bit_cyc=None):
         if max_bit_cyc is not None:
             self.max_bit_cyc = max_bit_cyc
         else:
@@ -124,7 +113,7 @@ class UART(Elaboratable):
         self.tx_rdy  = Signal()
         self.tx_ack  = Signal()
 
-        self.bus = UARTBus(pads, invert_rx=invert_rx, invert_tx=invert_tx)
+        self.bus = UARTBus(ports)
 
     def elaborate(self, platform):
         m = Module()

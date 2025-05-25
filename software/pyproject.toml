@@ -18,8 +18,7 @@ classifiers = [
   "Topic :: System :: Hardware",
 ]
 
-# See the source of `support.plugin` for reasoning behind this constraint.
-requires-python = "~=3.9, !=3.10.0, !=3.10.1, !=3.10.2"
+requires-python = "~=3.11"
 
 # Glasgow has only a few carefully chosen dependencies. The rationale for having them, as well as
 # the rationale for the particular version constraint, is explained below, and should be kept
@@ -32,7 +31,7 @@ dependencies = [
   # `typing_extensions` provides shims for such features. It uses SemVer.
   "typing_extensions>=4.8,<5",
   # Amaranth is the core of the Glasgow software/gateware interoperability layer. It uses SemVer.
-  "amaranth>=0.5.0,<0.6",
+  "amaranth>=0.5.6,<0.6",
   # `packaging` is used in the plugin system, `support.plugin`. It uses CalVer: the major version
   # is the two last digits of the year and the minor version is the release within that year.
   "packaging>=23.0",
@@ -45,10 +44,13 @@ dependencies = [
   # `libusb1` is used to communicate with the device, and its API mirrors the stable API/ABI of
   # of the native `libusb1` library. It increases major version when dropping support for older
   # Python versions.
-  "libusb1>=3.1.0",
+  "libusb1>=3.3.0",
+  # `cobs` is used to multiplex communication streams in applets. It uses an ad-hoc versioning
+  # system.
+  "cobs>=1.2.1",
   # `pyvcd` is used in the applet analyzer to dump waveform files. It is also a dependency of
   # Amaranth, and the version range here must be compatible with Amaranth's.
-  "pyvcd>=0.2,<0.5",
+  "pyvcd>=0.4.1,<0.5",
 ]
 
 [project.optional-dependencies]
@@ -71,6 +73,10 @@ http = [
   "aiohttp>=3.9.0",
   "aiohttp-remotes>=1.2,<2",
 ]
+numpy = [
+  "numpy~=2.2",
+  "matplotlib~=3.10"
+]
 
 [project.scripts]
 glasgow = "glasgow.cli:run_main"
@@ -81,6 +87,7 @@ benchmark = "glasgow.applet.internal.benchmark:BenchmarkApplet"
 
 analyzer = "glasgow.applet.interface.analyzer:AnalyzerApplet"
 uart = "glasgow.applet.interface.uart:UARTApplet"
+spi-analyzer = "glasgow.applet.interface.spi_analyzer:SPIAnalyzerApplet"
 spi-controller = "glasgow.applet.interface.spi_controller:SPIControllerApplet"
 spi-flashrom = "glasgow.applet.interface.spi_flashrom:SPIFlashromApplet"
 i2c-initiator = "glasgow.applet.interface.i2c_initiator:I2CInitiatorApplet"
@@ -89,7 +96,10 @@ jtag-pinout = "glasgow.applet.interface.jtag_pinout:JTAGPinoutApplet"
 jtag-probe = "glasgow.applet.interface.jtag_probe:JTAGProbeApplet"
 jtag-openocd = "glasgow.applet.interface.jtag_openocd:JTAGOpenOCDApplet"
 jtag-svf = "glasgow.applet.interface.jtag_svf:JTAGSVFApplet"
+jtag-xvc = "glasgow.applet.interface.jtag_xvc:JTAGXVCApplet"
 ps2-host = "glasgow.applet.interface.ps2_host:PS2HostApplet"
+qspi-analyzer = "glasgow.applet.interface.qspi_analyzer:QSPIAnalyzerApplet"
+qspi-controller = "glasgow.applet.interface.qspi_controller:QSPIControllerApplet"
 sbw-probe = "glasgow.applet.interface.sbw_probe:SpyBiWireProbeApplet"
 swd-openocd = "glasgow.applet.interface.swd_openocd:SWDOpenOCDApplet"
 
@@ -101,6 +111,7 @@ memory-floppy = "glasgow.applet.memory.floppy:MemoryFloppyApplet"
 
 debug-arc = "glasgow.applet.debug.arc:DebugARCApplet"
 debug-arm = "glasgow.applet.debug.arm.jtag:DebugARMJTAGApplet"
+debug-arm7 = "glasgow.applet.debug.arm.arm7:DebugARM7Applet"
 debug-mips = "glasgow.applet.debug.mips:DebugMIPSApplet"
 
 program-avr-spi = "glasgow.applet.program.avr.spi:ProgramAVRSPIApplet"
@@ -116,6 +127,7 @@ program-xc9500xl = "glasgow.applet.program.xc9500xl:ProgramXC9500XLApplet"
 program-xpla3 = "glasgow.applet.program.xpla3:ProgramXPLA3Applet"
 
 control-servo = "glasgow.applet.control.servo:ControlServoApplet"
+control-si535x = "glasgow.applet.control.si535x:ControlSi535xApplet"
 control-tps6598x = "glasgow.applet.control.tps6598x:ControlTPS6598xApplet"
 
 sensor-bmx280 = "glasgow.applet.sensor.bmx280:SensorBMx280Applet"
@@ -138,6 +150,14 @@ video-vga-output = "glasgow.applet.video.vga_output:VGAOutputApplet"
 video-ws2812-output = "glasgow.applet.video.ws2812_output:VideoWS2812OutputApplet"
 
 radio-nrf24l01 = "glasgow.applet.radio.nrf24l01:RadioNRF24L01Applet"
+
+[project.entry-points."glasgow.applet.tool"]
+memory-25x = "glasgow.applet.memory._25x.decode:Memory25xAppletTool"
+memory-prom = "glasgow.applet.memory.prom:MemoryPROMAppletTool"
+memory-floppy = "glasgow.applet.memory.floppy:MemoryFloppyAppletTool [numpy]"
+
+program-xc9500 = "glasgow.applet.program.xc9500:ProgramXC9500AppletTool"
+program-xc9500xl = "glasgow.applet.program.xc9500xl:ProgramXC9500XLAppletTool"
 
 [project.urls]
 "Documentation" = "https://glasgow-embedded.org/"

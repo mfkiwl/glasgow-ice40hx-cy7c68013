@@ -6,17 +6,27 @@ import sys
 import struct
 import logging
 import argparse
-from amaranth import *
 
-from ....support.logging import dump_hex
-from ....database.jedec import *
-from ....protocol.sfdp import *
-from ...interface.spi_controller import SPIControllerApplet
-from ... import *
+from amaranth import *
+from amaranth.lib import enum, io
+
+from glasgow.support.logging import dump_hex
+from glasgow.database.jedec import *
+from glasgow.protocol.sfdp import *
+from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
+from glasgow.applet.interface.qspi_controller import QSPIControllerInterface, QSPIControllerApplet
+
+
+__all__ = ["Memory25xError", "Memory25xInterface"]
 
 
 class Memory25xError(GlasgowAppletError):
     pass
+
+
+class Memory25xAddrMode(enum.Enum):
+    ThreeByte = enum.auto()
+    FourByte  = enum.auto()
 
 
 BIT_WIP  = 0b00000001
@@ -26,34 +36,12 @@ BIT_CP   = 0b01000000
 BIT_ERR  = 0b10000000
 
 
-# This is also used in SPIFlashromApplet.
-class Memory25xSubtarget(Elaboratable):
-    def __init__(self, controller, hold_t, cs_active):
-        self.controller = controller
-        self.hold_t = hold_t
-        self.cs_active = cs_active
-
-    def elaborate(self, platform):
-        m = Module()
-
-        m.submodules.controller = self.controller
-
-        m.d.comb += self.controller.bus.oe.eq(self.controller.bus.cs == self.cs_active)
-
-        if self.hold_t is not None:
-            m.d.comb += [
-                self.hold_t.oe.eq(1),
-                self.hold_t.o.eq(1),
-            ]
-
-        return m
-
-
 class Memory25xInterface:
-    def __init__(self, interface, logger):
-        self.lower       = interface
-        self._logger     = logger
-        self._level      = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
+    def __init__(self, logger, assembly, *, cs, sck, io):
+        self._logger = logger
+        self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
+
+        self.qspi = QSPIControllerInterface(logger, assembly, cs=cs, sck=sck, io=io)
 
     def _log(self, message, *args):
         self._logger.log(self._level, "25x: " + message, *args)
@@ -63,11 +51,13 @@ class Memory25xInterface:
 
         self._log("cmd=%02X arg=<%s> dummy=%d ret=%d", cmd, dump_hex(arg), dummy, ret)
 
-        await self.lower.write(bytearray([cmd, *arg, *[0 for _ in range(dummy)]]),
-                               hold_ss=(ret > 0))
-        result = await self.lower.read(ret)
+        async with self.qspi.select():
+            await self.qspi.write(bytes([cmd, *arg]))
+            await self.qspi.dummy(dummy * 8)
+            result = await self.qspi.read(ret) if ret else None
 
-        self._log("result=<%s>", dump_hex(result))
+        if result is not None:
+            self._log("result=<%s>", dump_hex(result))
 
         return result
 
@@ -236,7 +226,7 @@ class Memory25xSFDPParser(SFDPParser):
         return await self._m25x_iface.read_sfdp(offset, length)
 
 
-class Memory25xApplet(SPIControllerApplet):
+class Memory25xApplet(GlasgowAppletV2):
     logger = logging.getLogger(__name__)
     help = "read and write 25-series SPI Flash memories"
     description = """
@@ -251,15 +241,16 @@ class Memory25xApplet(SPIControllerApplet):
     The pinout of a typical 25-series IC is as follows:
 
     ::
-            16-pin             8-pin
-        HOLD# @ * SCK       CS# @ * VCC
-          VCC * * COPI     CIPO * * HOLD#
-          N/C * * N/C       WP# * * SCK
-          N/C * * N/C       GND * * COPI
-          N/C * * N/C
-          N/C * * N/C
-          CS# * * GND
-         CIPO * * WP#
+
+                16-pin                     8-pin
+        IO3/HOLD# @ * SCK               CS# @ * VCC
+              VCC * * IO0/COPI     IO1/CIPO * * IO3/HOLD#
+              N/C * * N/C           IO2/WP# * * SCK
+              N/C * * N/C               GND * * IO0/COPI
+              N/C * * N/C
+              N/C * * N/C
+              CS# * * GND
+         IO1/CIPO * * IO2/WP#
 
     The default pin assignment follows the pinouts above in the clockwise direction, making it easy
     to connect the memory with probes or, alternatively, crimp an IDC cable wired to a SOIC clip.
@@ -269,32 +260,33 @@ class Memory25xApplet(SPIControllerApplet):
     The advantage of using the `spi-flashrom` applet is that flashrom offers compatibility with
     a wider variety of devices, some of which may not be supported by the `memory-25x` applet.
     """
+    required_revision = QSPIControllerApplet.required_revision
 
     @classmethod
     def add_build_arguments(cls, parser, access):
-        super().add_build_arguments(parser, access, omit_pins=True)
+        access.add_voltage_argument(parser)
+        access.add_pins_argument(parser, "cs",  required=True,          default="A5")
+        access.add_pins_argument(parser, "io",  required=True, width=4, default="A2,A4,A3,A0",
+            help="bind the applet I/O lines 'copi', 'cipo', 'wp', 'hold' to PINS")
+        access.add_pins_argument(parser, "sck", required=True,          default="A1")
 
-        access.add_pin_argument(parser, "cs",   default=True, required=True)
-        access.add_pin_argument(parser, "cipo", default=True, required=True)
-        access.add_pin_argument(parser, "wp",   default=True)
-        access.add_pin_argument(parser, "copi", default=True, required=True)
-        access.add_pin_argument(parser, "sck",  default=True, required=True)
-        access.add_pin_argument(parser, "hold", default=True)
-
-    def build_subtarget(self, target, args):
-        subtarget = super().build_subtarget(target, args)
-        if args.pin_hold is not None:
-            hold_t = self.mux_interface.get_pin(args.pin_hold)
-        else:
-            hold_t = None
-        return Memory25xSubtarget(subtarget, hold_t, args.cs_active)
-
-    async def run(self, device, args):
-        spi_iface = await self.run_lower(Memory25xApplet, device, args)
-        return Memory25xInterface(spi_iface, self.logger)
+    def build(self, args):
+        with self.assembly.add_applet(self):
+            self.assembly.use_voltage(args.voltage)
+            self.m25x_iface = Memory25xInterface(self.logger, self.assembly,
+                cs=args.cs, sck=args.sck, io=args.io)
 
     @classmethod
-    def add_interact_arguments(cls, parser):
+    def add_setup_arguments(cls, parser):
+        parser.add_argument(
+            "-f", "--frequency", metavar="FREQ", type=int, default=12000,
+            help="set SCK frequency to FREQ kHz (default: %(default)s)")
+
+    async def setup(self, args):
+        await self.m25x_iface.qspi.set_sck_freq(args.frequency * 1000)
+
+    @classmethod
+    def add_run_arguments(cls, parser):
         def address(arg):
             return int(arg, 0)
         def length(arg):
@@ -400,13 +392,13 @@ class Memory25xApplet(SPIControllerApplet):
                     sys.stdout.write(f"; {status}")
             sys.stdout.flush()
 
-    async def interact(self, device, args, m25x_iface):
-        await m25x_iface.wakeup()
+    async def run(self, args):
+        await self.m25x_iface.wakeup()
 
         if args.operation in ("program-page", "program",
                               "erase-sector", "erase-block", "erase-chip",
                               "erase-program"):
-            status = await m25x_iface.read_status()
+            status = await self.m25x_iface.read_status()
             if status & MSK_PROT:
                 self.logger.warning("block protect bits are set to %s, program/erase command "
                                     "might not succeed", "{:04b}"
@@ -414,11 +406,11 @@ class Memory25xApplet(SPIControllerApplet):
 
         if args.operation == "identify":
             legacy_device_id, = \
-                await m25x_iface.read_device_id()
+                await self.m25x_iface.read_device_id()
             short_manufacturer_id, short_device_id = \
-                await m25x_iface.read_manufacturer_device_id()
+                await self.m25x_iface.read_manufacturer_device_id()
             long_manufacturer_id, long_device_id = \
-                await m25x_iface.read_manufacturer_long_device_id()
+                await self.m25x_iface.read_manufacturer_long_device_id()
             if short_manufacturer_id not in (0x00, 0xff):
                 manufacturer_name = jedec_mfg_name_from_bytes([short_manufacturer_id]) or "unknown"
                 self.logger.info("JEDEC manufacturer %#04x (%s) device %#04x (8-bit ID)",
@@ -436,30 +428,20 @@ class Memory25xApplet(SPIControllerApplet):
                                      legacy_device_id)
 
             try:
-                sfdp = await Memory25xSFDPParser(m25x_iface)
-                self.logger.info("device has valid SFDP %d.%d (%s) descriptor",
-                                 *sfdp.version, sfdp.jedec_revision)
-                for index, table in enumerate(sfdp):
-                    if table.vendor_id == 0x00: # JEDEC
-                        self.logger.info("  SFDP table #%d: %s %d.%d (%s)",
-                                         index, table, *table.version, table.jedec_revision)
-                    else:
-                        self.logger.info("  SFDP table #%d: %s %d.%d",
-                                         index, table, *table.version)
-                    if any(table):
-                        key_width = max(len(k) for k, v in table) + 1
-                        for key, value in table:
-                            self.logger.info("    %-*s: %s", key_width, key, value)
+                sfdp = await Memory25xSFDPParser(self.m25x_iface)
+                self.logger.info(f"device has valid {sfdp} descriptor")
+                for line in sfdp.description():
+                    self.logger.info(f"  {line}")
             except ValueError as e:
                 self.logger.info("device does not have valid SFDP data: %s", str(e))
 
         if args.operation in ("read", "fast-read"):
             if args.operation == "read":
-                data = await m25x_iface.read(args.address, args.length,
-                                              callback=self._show_progress)
+                data = await self.m25x_iface.read(args.address, args.length,
+                                             callback=self._show_progress)
             if args.operation == "fast-read":
-                data = await m25x_iface.fast_read(args.address, args.length,
-                                                   callback=self._show_progress)
+                data = await self.m25x_iface.fast_read(args.address, args.length,
+                                                  callback=self._show_progress)
 
             if args.file:
                 args.file.write(data)
@@ -474,14 +456,14 @@ class Memory25xApplet(SPIControllerApplet):
                 data = args.file.read()
 
             if args.operation == "program-page":
-                await m25x_iface.write_enable()
-                await m25x_iface.page_program(args.address, data)
+                await self.m25x_iface.write_enable()
+                await self.m25x_iface.page_program(args.address, data)
             if args.operation == "program":
-                await m25x_iface.program(args.address, data, args.page_size,
-                                          callback=self._show_progress)
+                await self.m25x_iface.program(args.address, data, args.page_size,
+                                         callback=self._show_progress)
             if args.operation == "erase-program":
-                await m25x_iface.erase_program(args.address, data, args.sector_size,
-                                                args.page_size, callback=self._show_progress)
+                await self.m25x_iface.erase_program(args.address, data, args.sector_size,
+                                               args.page_size, callback=self._show_progress)
 
         if args.operation == "verify":
             if args.data is not None:
@@ -489,7 +471,7 @@ class Memory25xApplet(SPIControllerApplet):
             if args.file is not None:
                 gold_data = args.file.read()
 
-            flash_data = await m25x_iface.read(args.address, len(gold_data))
+            flash_data = await self.m25x_iface.read(args.address, len(gold_data))
             if gold_data == flash_data:
                 self.logger.info("verify PASS")
             else:
@@ -503,25 +485,25 @@ class Memory25xApplet(SPIControllerApplet):
 
         if args.operation in ("erase-sector", "erase-block"):
             for address in args.addresses:
-                await m25x_iface.write_enable()
+                await self.m25x_iface.write_enable()
                 if args.operation == "erase-sector":
-                    await m25x_iface.sector_erase(address)
+                    await self.m25x_iface.sector_erase(address)
                 if args.operation == "erase-block":
-                    await m25x_iface.block_erase(address)
+                    await self.m25x_iface.block_erase(address)
 
         if args.operation == "erase-chip":
-            await m25x_iface.write_enable()
-            await m25x_iface.chip_erase()
+            await self.m25x_iface.write_enable()
+            await self.m25x_iface.chip_erase()
 
         if args.operation == "protect":
-            status = await m25x_iface.read_status()
+            status = await self.m25x_iface.read_status()
             if args.bits is None:
                 self.logger.info("block protect bits are set to %s",
                                  f"{(status & MSK_PROT) >> 2:04b}")
             else:
                 status = (status & ~MSK_PROT) | ((args.bits << 2) & MSK_PROT)
-                await m25x_iface.write_enable()
-                await m25x_iface.write_status(status)
+                await self.m25x_iface.write_enable()
+                await self.m25x_iface.write_status(status)
 
     @classmethod
     def tests(cls):

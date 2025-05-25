@@ -6,6 +6,7 @@ import asyncio
 import logging
 import argparse
 from amaranth import *
+from amaranth.lib import io
 
 from ....support.logging import *
 from ....support.bits import *
@@ -20,9 +21,9 @@ class RadioNRF24L01Error(GlasgowAppletError):
 
 
 class RadioNRF24L01Subtarget(Elaboratable):
-    def __init__(self, controller, ce_t, dut_ce):
+    def __init__(self, controller, port_ce, dut_ce):
         self.controller = controller
-        self.ce_t = ce_t
+        self.port_ce = port_ce
         self.dut_ce = dut_ce
 
     def elaborate(self, platform):
@@ -30,10 +31,8 @@ class RadioNRF24L01Subtarget(Elaboratable):
 
         m.submodules.controller = self.controller
 
-        m.d.comb += [
-            self.ce_t.o.eq(self.dut_ce),
-            self.ce_t.oe.eq(1),
-        ]
+        m.submodules.ce_buffer = ce_buffer = io.Buffer("o", self.port_ce)
+        m.d.comb += ce_buffer.o.eq(self.dut_ce)
 
         return m
 
@@ -51,8 +50,9 @@ class RadioNRF24L01Interface:
 
     async def sync(self):
         self._log("sync")
-        await self.lower.write([OP_NOP])
-        await self.lower.read(1)
+        async with self.lower.select():
+            await self.lower.write([OP_NOP])
+            await self.lower.read(1)
 
     async def enable(self):
         await self.sync()
@@ -70,15 +70,17 @@ class RadioNRF24L01Interface:
 
     async def read_register_wide(self, address, length):
         assert address in range(0x1f)
-        await self.lower.write([OP_R_REGISTER|address], hold_ss=True)
-        value = await self.lower.read(length)
+        async with self.lower.select():
+            await self.lower.write([OP_R_REGISTER|address])
+            value = await self.lower.read(length)
         self._log("read register [%02x]=<%s>", address, dump_hex(value))
         return value
 
     async def write_register_wide(self, address, value):
         assert address in range(0x1f)
         self._log("write register [%02x]=<%s>", address, dump_hex(value))
-        await self.lower.write([OP_W_REGISTER|address, *value])
+        async with self.lower.select():
+            await self.lower.write([OP_W_REGISTER|address, *value])
 
     async def read_register(self, address):
         value, = await self.read_register_wide(address, 1)
@@ -90,7 +92,8 @@ class RadioNRF24L01Interface:
     async def poll_rx_status(self, delay=0.010):
         poll_bits = clear_bits = REG_STATUS(RX_DR=1).to_int()
         while True:
-            status_bits, _ = await self.lower.transfer([OP_W_REGISTER|ADDR_STATUS, clear_bits])
+            async with self.lower.select():
+                status_bits, _ = await self.lower.exchange([OP_W_REGISTER|ADDR_STATUS, clear_bits])
             status = REG_STATUS.from_int(status_bits)
             self._log("poll rx status %s", status.bits_repr(omit_zero=True))
             if status_bits & poll_bits:
@@ -99,20 +102,23 @@ class RadioNRF24L01Interface:
         return status
 
     async def read_rx_payload_length(self):
-        await self.lower.write([OP_R_RX_PL_WID], hold_ss=True)
-        length, = await self.lower.read(1)
+        async with self.lower.select():
+            await self.lower.write([OP_R_RX_PL_WID])
+            length, = await self.lower.read(1)
         self._log("read rx payload length=%d", length)
         return length
 
     async def read_rx_payload(self, length):
-        await self.lower.write([OP_R_RX_PAYLOAD], hold_ss=True)
-        payload = await self.lower.read(length)
+        async with self.lower.select():
+            await self.lower.write([OP_R_RX_PAYLOAD])
+            payload = await self.lower.read(length)
         self._log("read rx payload=<%s>", dump_hex(payload))
         return payload
 
     async def flush_rx(self):
         self._log("flush rx")
-        await self.lower.write([OP_FLUSH_RX])
+        async with self.lower.select():
+            await self.lower.write([OP_FLUSH_RX])
 
     async def flush_rx_all(self):
         while True:
@@ -127,7 +133,8 @@ class RadioNRF24L01Interface:
         poll_bits  = REG_STATUS(TX_DS=1, MAX_RT=1).to_int()
         clear_bits = REG_STATUS(TX_DS=1).to_int()
         while True:
-            status_bits, _ = await self.lower.transfer([OP_W_REGISTER|ADDR_STATUS, clear_bits])
+            async with self.lower.select():
+                status_bits, _ = await self.lower.exchange([OP_W_REGISTER|ADDR_STATUS, clear_bits])
             status = REG_STATUS.from_int(status_bits)
             self._log("poll rx status %s", status.bits_repr(omit_zero=True))
             if status_bits & poll_bits:
@@ -137,18 +144,21 @@ class RadioNRF24L01Interface:
 
     async def write_tx_payload(self, payload, *, ack=True):
         self._log("write tx payload=<%s> ack=%s", dump_hex(payload), "yes" if ack else "no")
-        if ack:
-            await self.lower.write([OP_W_TX_PAYLOAD, *payload])
-        else:
-            await self.lower.write([OP_W_TX_PAYLOAD_NOACK, *payload])
+        async with self.lower.select():
+            if ack:
+                await self.lower.write([OP_W_TX_PAYLOAD, *payload])
+            else:
+                await self.lower.write([OP_W_TX_PAYLOAD_NOACK, *payload])
 
     async def reuse_tx_payload(self):
         self._log("reuse tx payload")
-        await self.lower.write([OP_REUSE_TX_PL])
+        async with self.lower.select():
+            await self.lower.write([OP_REUSE_TX_PL])
 
     async def flush_tx(self):
         self._log("flush tx")
-        await self.lower.write([OP_FLUSH_TX])
+        async with self.lower.select():
+            await self.lower.write([OP_FLUSH_TX])
 
     async def flush_tx_all(self):
         while True:
@@ -187,19 +197,17 @@ class RadioNRF24L01Applet(GlasgowApplet):
          CIPO * * IRQ
     """
 
-    __pins = ("ce", "cs", "sck", "copi", "cipo", "irq")
-
     @classmethod
     def add_build_arguments(cls, parser, access):
         access.add_build_arguments(parser)
 
         # Order matches the pin order, in clockwise direction.
-        access.add_pin_argument(parser, "ce",   default=True)
-        access.add_pin_argument(parser, "cs",   default=True)
-        access.add_pin_argument(parser, "sck",  default=True)
-        access.add_pin_argument(parser, "copi", default=True)
-        access.add_pin_argument(parser, "cipo", default=True)
-        access.add_pin_argument(parser, "irq",  default=True)
+        access.add_pins_argument(parser, "ce",   default=True)
+        access.add_pins_argument(parser, "cs",   default=True)
+        access.add_pins_argument(parser, "sck",  default=True)
+        access.add_pins_argument(parser, "copi", default=True)
+        access.add_pins_argument(parser, "cipo", default=True)
+        access.add_pins_argument(parser, "irq",  default=True)
 
         parser.add_argument(
             "-f", "--frequency", metavar="FREQ", type=int, default=1000,
@@ -209,20 +217,26 @@ class RadioNRF24L01Applet(GlasgowApplet):
         dut_ce, self.__addr_dut_ce = target.registers.add_rw(1)
 
         self.mux_interface = iface = target.multiplexer.claim_interface(self, args)
-        pads = iface.get_pads(args, pins=self.__pins)
+        ports=iface.get_port_group(
+                ce   = args.ce,
+                cs   = args.cs,
+                sck  = args.sck,
+                copi = args.copi,
+                cipo = args.cipo,
+                irq  = args.irq
+            )
 
         controller = SPIControllerSubtarget(
-            pads=pads,
+            ports=ports,
             out_fifo=iface.get_out_fifo(),
             in_fifo=iface.get_in_fifo(),
             period_cyc=math.ceil(target.sys_clk_freq / (args.frequency * 1000)),
             delay_cyc=math.ceil(target.sys_clk_freq / 1e6),
             sck_idle=0,
             sck_edge="rising",
-            cs_active=0,
         )
 
-        subtarget = RadioNRF24L01Subtarget(controller, pads.ce_t, dut_ce)
+        subtarget = RadioNRF24L01Subtarget(controller, ports.ce, dut_ce)
 
         return iface.add_subtarget(subtarget)
 

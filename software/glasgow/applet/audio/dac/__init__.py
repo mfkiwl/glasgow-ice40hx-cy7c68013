@@ -2,49 +2,51 @@ import logging
 import asyncio
 import argparse
 from amaranth import *
+from amaranth.lib import io, wiring
+from amaranth.lib.wiring import In, Out
 
 from ....support.endpoint import *
 from ....gateware.clockgen import *
 from ... import *
 
 
-class SigmaDeltaDACChannel(Elaboratable):
-    def __init__(self, output, bits, signed):
-        self._output = output
-
+class SigmaDeltaDACChannel(wiring.Component):
+    def __init__(self, bits, signed):
         self.bits   = bits
         self.signed = signed
 
-        self.stb    = Signal()
+        super().__init__({
+            "input":  In(bits), # PCM code (signed or unsigned)
+            "update": In(1),    # update input, for multi-channel synchronization
 
-        self.level  = Signal(bits)
-        self.update = Signal()
+            "output": Out(1),   # PDM pulse train
+            "strobe": In(1),    # strobe input; adds code to accumulator and updates `output`
+        })
 
     def elaborate(self, platform):
         m = Module()
 
-        level_u = Signal(self.bits)
-        if self.signed:
-            m.d.comb += level_u.eq(self.level - (1 << (self.bits - 1)))
-        else:
-            m.d.comb += level_u.eq(self.level)
-
-        accum   = Signal(self.bits)
-        level_r = Signal(self.bits)
-
-        with m.If(self.stb):
-            m.d.sync += Cat(accum, self._output).eq(accum + level_r)
+        # Glasgow has unipolar supply, so signed 0 needs to become Vcc/2.
+        level = Signal(self.bits)
         with m.If(self.update):
-            m.d.sync += level_r.eq(level_u)
+            if self.signed:
+                m.d.sync += level.eq(self.input - (1 << (self.bits - 1)))
+            else:
+                m.d.sync += level.eq(self.input)
+
+        # Carry out from the accumulator generates the PDM pulse train.
+        accum = Signal(self.bits)
+        with m.If(self.strobe):
+            m.d.sync += Cat(accum, self.output).eq(accum + level)
 
         return m
 
 
 class AudioDACSubtarget(Elaboratable):
-    def __init__(self, pads, out_fifo, pulse_cyc, sample_cyc, width, signed):
+    def __init__(self, ports, out_fifo, pulse_cyc, sample_cyc, width, signed):
         assert width in (1, 2)
 
-        self.pads = pads
+        self.ports = ports
         self.out_fifo = out_fifo
         self.pulse_cyc = pulse_cyc
         self.sample_cyc = sample_cyc
@@ -54,23 +56,25 @@ class AudioDACSubtarget(Elaboratable):
     def elaborate(self, platform):
         m = Module()
 
-        channels = [
-            SigmaDeltaDACChannel(output, bits=self.width * 8, signed=self.signed)
-            for output in self.pads.o_t.o
-        ]
-        m.submodules += channels
+        m.submodules.o_buffer = o_buffer = io.Buffer("o", self.ports.o)
+
+        m.submodules += (channels := [
+            SigmaDeltaDACChannel(bits=self.width * 8, signed=self.signed)
+            for _ in range(len(o_buffer.o))
+        ])
+        m.d.comb += o_buffer.o.eq(Cat(channel.output for channel in channels))
 
         m.submodules.clkgen = clkgen = ClockGen(self.pulse_cyc)
         for channel in channels:
-            m.d.comb += channel.stb.eq(clkgen.stb_r)
+            m.d.comb += channel.strobe.eq(clkgen.stb_r)
 
         timer = Signal(range(self.sample_cyc))
 
         with m.FSM():
             with m.State("STANDBY"):
-                m.d.sync += self.pads.o_t.oe.eq(0)
+                m.d.sync += o_buffer.oe.eq(0)
                 with m.If(self.out_fifo.r_rdy):
-                    m.d.sync += self.pads.o_t.oe.eq(1)
+                    m.d.sync += o_buffer.oe.eq(1)
                     m.next = "WAIT"
 
             with m.State("WAIT"):
@@ -89,7 +93,7 @@ class AudioDACSubtarget(Elaboratable):
                     with m.State("CHANNEL-%d-READ-1" % index):
                         m.d.comb += self.out_fifo.r_en.eq(1)
                         with m.If(self.out_fifo.r_rdy):
-                            m.d.sync += channel.level[0:8].eq(self.out_fifo.r_data)
+                            m.d.sync += channel.input[0:8].eq(self.out_fifo.r_data)
                             m.next = next_state
                         with m.Else():
                             m.next = "STANDBY"
@@ -97,14 +101,14 @@ class AudioDACSubtarget(Elaboratable):
                     with m.State("CHANNEL-%d-READ-1" % index):
                         m.d.comb += self.out_fifo.r_en.eq(1)
                         with m.If(self.out_fifo.r_rdy):
-                            m.d.sync += channel.level[0:8].eq(self.out_fifo.r_data)
+                            m.d.sync += channel.input[0:8].eq(self.out_fifo.r_data)
                             m.next = "CHANNEL-%d-READ-2" % index
                         with m.Else():
                             m.next = "STANDBY"
                     with m.State("CHANNEL-%d-READ-2" % index):
                         m.d.comb += self.out_fifo.r_en.eq(1)
                         with m.If(self.out_fifo.r_rdy):
-                            m.d.sync += channel.level[8:16].eq(self.out_fifo.r_data)
+                            m.d.sync += channel.input[8:16].eq(self.out_fifo.r_data)
                             m.next = next_state
                         with m.Else():
                             m.next = "STANDBY"
@@ -133,7 +137,7 @@ class AudioDACApplet(GlasgowApplet):
     For example, to play an ogg file:
 
         $ sox samples.ogg -c 2 -r 48000 samples.u16
-        $ glasgow run audio-dac --pins-o 0,1 -r 48000 -w 2 -u play samples.u16
+        $ glasgow run audio-dac --o 0,1 -r 48000 -w 2 -u play samples.u16
 
     To use the DAC as a PulseAudio sink, add the following line to default.pa:
 
@@ -142,16 +146,14 @@ class AudioDACApplet(GlasgowApplet):
 
     Then run:
 
-        $ glasgow run audio-dac --pins-o 0,1 -r 48000 -w 2 -s connect tcp::12345
+        $ glasgow run audio-dac --o 0,1 -r 48000 -w 2 -s connect tcp::12345
     """
-
-    __pin_sets = ("o",)
 
     @classmethod
     def add_build_arguments(cls, parser, access):
         super().add_build_arguments(parser, access)
 
-        access.add_pin_set_argument(parser, "o", width=range(1, 17), default=1)
+        access.add_pins_argument(parser, "o", width=range(1, 17), default=1)
 
         parser.add_argument(
             "-f", "--frequency", metavar="FREQ", type=int,
@@ -183,7 +185,7 @@ class AudioDACApplet(GlasgowApplet):
             # the oscillator on the board is imprecise, and with no additional error.
             max_deviation_ppm=0)
         subtarget = iface.add_subtarget(AudioDACSubtarget(
-            pads=iface.get_pads(args, pin_sets=self.__pin_sets),
+            ports=iface.get_port_group(o = args.o),
             out_fifo=iface.get_out_fifo(),
             pulse_cyc=pulse_cyc,
             sample_cyc=sample_cyc,
