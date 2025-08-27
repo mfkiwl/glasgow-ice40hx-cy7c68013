@@ -1,7 +1,8 @@
-from typing import Any, Optional, Generator
+from typing import Any, Optional, Generator, BinaryIO
 from collections.abc import Mapping
 from collections import defaultdict
-from contextlib import contextmanager, asynccontextmanager
+from contextlib import contextmanager
+import os
 import asyncio
 import logging
 
@@ -9,17 +10,16 @@ from amaranth import *
 from amaranth.hdl import ShapeCastable
 from amaranth.lib import wiring, io
 from amaranth.build import ResourceError
-import usb1
 
+from ..support import usb
 from ..support.logging import dump_hex
 from ..support.task_queue import TaskQueue
 from ..support.chunked_fifo import ChunkedFIFO
 from ..gateware.i2c import I2CTarget
 from ..gateware.registers import I2CRegisters
 from ..gateware.fx2_crossbar import FX2Crossbar
-from ..gateware.stream import StreamFIFO
+from ..gateware.stream import Queue
 from ..abstract import *
-from .platform import GlasgowPlatformPort
 from .platform.rev_ab import GlasgowRevABPlatform
 from .platform.rev_c import GlasgowRevC0Platform, GlasgowRevC123Platform
 from .toolchain import find_toolchain
@@ -99,12 +99,22 @@ class HardwareRORegister(AbstractRORegister):
             value = self._shape.from_bits(value)
         return value
 
+    @property
+    def shape(self):
+        return self._shape
+
 
 class HardwareRWRegister(HardwareRORegister, AbstractRWRegister):
     async def set(self, value):
         if isinstance(self._shape, ShapeCastable):
             value = Const.cast(self._shape.const(value)).value
         await self._parent.device.write_register(self._address, value, self._width)
+
+
+def _check_detach():
+    # See the comment in `HardwareAssembly.start()`.
+    if os.name == "nt":
+        raise NotImplementedError("pipe detaching is not supported on Windows due to WinUSB limitations")
 
 
 class HardwareInPipe(AbstractInPipe):
@@ -116,25 +126,32 @@ class HardwareInPipe(AbstractInPipe):
         self._in_ep_address     = None
         self._in_packet_size    = None
 
+        self._in_running        = False
         self._in_buffer_size    = buffer_size
         self._in_pushback       = asyncio.Condition()
         self._in_tasks          = TaskQueue()
         self._in_buffer         = ChunkedFIFO()
         self._in_stalls         = 0
 
+    async def _attach(self):
+        await self._parent.device.usb_device.claim_interface(self._in_interface)
+
     async def _start(self):
+        assert not self._in_running
         self._logger.trace(f"IN pipe {self._in_interface}: starting")
-        self._parent.device.usb_handle.claimInterface(self._in_interface)
-        self._parent.device.usb_handle.setInterfaceAltSetting(self._in_interface, 1)
+        await self._parent.device.usb_device.select_alternate_interface(self._in_interface, 1)
         for _ in range(_xfers_per_queue):
             self._in_tasks.submit(self._in_task())
+        self._in_running = True
 
     async def _stop(self):
+        if not self._in_running:
+            return
         self._logger.trace(f"IN pipe {self._in_interface}: stopping")
         await self._in_tasks.cancel()
         self._in_buffer.clear()
-        self._parent.device.usb_handle.setInterfaceAltSetting(self._in_interface, 0)
-        self._parent.device.usb_handle.releaseInterface(self._in_interface)
+        await self._parent.device.usb_device.select_alternate_interface(self._in_interface, 0)
+        self._in_running = False
 
     async def _in_task(self):
         if self._in_buffer_size is not None:
@@ -153,7 +170,7 @@ class HardwareInPipe(AbstractInPipe):
     def readable(self) -> int:
         return len(self._in_buffer)
 
-    async def recv(self, length):
+    async def recv(self, length) -> memoryview:
         assert length > 0
 
         # Return exactly the requested length.
@@ -183,10 +200,42 @@ class HardwareInPipe(AbstractInPipe):
         self._logger.trace(f"IN pipe {self._in_interface}: read <%s>", dump_hex(result))
         return result
 
+    async def recv_until(self, delimiter) -> bytes:
+        assert len(delimiter) >= 1
+
+        self._logger.trace(f"IN pipe {self._in_interface}: need <%s> delimiter",
+            dump_hex(delimiter))
+
+        chunks = []
+        while True:
+            while len(self._in_buffer) == 0:
+                self._in_stalls += 1
+                assert self._in_tasks
+                await self._in_tasks.wait_one()
+
+            async with self._in_pushback:
+                chunk = self._in_buffer.read_until(delimiter)
+                self._in_pushback.notify_all()
+
+            chunks.append(chunk)
+            if chunk[-len(delimiter):] == delimiter:
+                break
+
+        result = b"".join(chunks)
+        self._logger.trace(f"IN pipe {self._in_interface}: read <%s>", dump_hex(result))
+        return result
+
     async def reset(self):
         self._logger.trace(f"IN pipe {self._in_interface}: reset")
         await self._stop()
         await self._start()
+
+    async def detach(self) -> tuple[int, None]:
+        self._logger.trace(f"IN pipe {self._in_interface}: detaching")
+        _check_detach()
+        await self._stop()
+        await self._parent.device.usb_device.release_interface(self._in_interface)
+        return self._in_interface, None
 
     def statistics(self):
         self._logger.info(f"IN pipe {self._in_interface} statistics:")
@@ -205,23 +254,30 @@ class HardwareOutPipe(AbstractOutPipe):
         self._out_ep_address    = None
         self._out_packet_size   = None
 
+        self._out_running       = False
         self._out_buffer_size   = buffer_size
         self._out_inflight      = 0
         self._out_tasks         = TaskQueue()
         self._out_buffer        = ChunkedFIFO()
         self._out_stalls        = 0
 
+    async def _attach(self):
+        await self._parent.device.usb_device.claim_interface(self._out_interface)
+
     async def _start(self):
+        assert not self._out_running
         self._logger.trace(f"OUT pipe {self._out_interface}: starting")
-        self._parent.device.usb_handle.claimInterface(self._out_interface)
-        self._parent.device.usb_handle.setInterfaceAltSetting(self._out_interface, 1)
+        await self._parent.device.usb_device.select_alternate_interface(self._out_interface, 1)
+        self._out_running = True
 
     async def _stop(self):
+        if not self._out_running:
+            return
         self._logger.trace(f"OUT pipe {self._out_interface}: clearing")
         await self._out_tasks.cancel()
         self._out_buffer.clear()
-        self._parent.device.usb_handle.setInterfaceAltSetting(self._out_interface, 0)
-        self._parent.device.usb_handle.releaseInterface(self._out_interface)
+        await self._parent.device.usb_device.select_alternate_interface(self._out_interface, 0)
+        self._out_running = False
 
     def _out_slice(self):
         # Fast path: read as much contiguous data as possible, up to our transfer size.
@@ -342,6 +398,13 @@ class HardwareOutPipe(AbstractOutPipe):
         await self._stop()
         await self._start()
 
+    async def detach(self) -> tuple[None, int]:
+        self._logger.trace(f"OUT pipe {self._out_interface}: detaching")
+        _check_detach()
+        await self._stop()
+        await self._parent.device.usb_device.release_interface(self._out_interface)
+        return None, self._out_interface
+
     def statistics(self):
         self._logger.info(f"OUT pipe {self._out_interface} statistics:")
         self._logger.info("  total   : %d B",   self._out_buffer.total_written_bytes)
@@ -359,6 +422,10 @@ class HardwareInOutPipe(HardwareInPipe, HardwareOutPipe, AbstractInOutPipe):
         HardwareInPipe.statistics(self)
         HardwareOutPipe.statistics(self)
 
+    async def _attach(self):
+        await HardwareInPipe._attach(self)
+        await HardwareOutPipe._attach(self)
+
     async def _start(self):
         await HardwareInPipe._start(self)
         await HardwareOutPipe._start(self)
@@ -371,6 +438,12 @@ class HardwareInOutPipe(HardwareInPipe, HardwareOutPipe, AbstractInOutPipe):
         self._logger.trace(f"IN/OUT pipe {self._in_interface}/{self._out_interface}: reset")
         await self._stop()
         await self._start()
+
+    async def detach(self) -> tuple[int, int]:
+        self._logger.trace(f"IN/OUT pipe {self._in_interface}/{self._out_interface}: detaching")
+        _check_detach()
+        await self._stop()
+        return self._in_interface, self._out_interface
 
 
 class HardwareAssembly(AbstractAssembly):
@@ -389,6 +462,10 @@ class HardwareAssembly(AbstractAssembly):
             case _:
                 assert False, f"invalid revision {revision}"
 
+    @classmethod
+    async def find_device(cls, serial: Optional[str] = None) -> 'HardwareAssembly':
+        return cls(device=await GlasgowDevice.find(serial))
+
     def __init__(self, *,
             device: Optional[GlasgowDevice] = None,
             revision: Optional[str] = None):
@@ -400,11 +477,10 @@ class HardwareAssembly(AbstractAssembly):
             self._device    = None
             self._revision  = revision
         else:
-            self._device    = GlasgowDevice()
-            self._revision  = self._device.revision
+            raise ValueError("must provide either device or revision")
 
         self._platform      = self._create_platform(self._revision)
-        self._registers     = [] # (register, signal)
+        self._registers     = [] # (register, signal, domain)
         self._domains       = [] # domain
         self._modules       = [] # (domain, elaboratable, name)
         self._in_streams    = [] # (domain, in_stream, in_flush, fifo_depth)
@@ -453,7 +529,7 @@ class HardwareAssembly(AbstractAssembly):
         # TODO: make this a proper error and not an assertion
         pin_name = f"{pin.port}{pin.number}"
         assert pin_name in self._platform.glasgow_pins, f"unknown or already used pin {pin_name}"
-        self._logger.debug(f"assigning pin {port_name!r} to {pin_name}")
+        self._logger.debug("assigning pin %s to %s%s", port_name, pin_name, " (inverted)" if pin.invert else "")
         if (pin.port, pin.number) not in self._pulls:
             self._pulls[pin.port, pin.number] = PullState.Float
         port = self._platform.glasgow_pins.pop(pin_name)
@@ -469,17 +545,17 @@ class HardwareAssembly(AbstractAssembly):
         assert self._artifact is None, "cannot add a register to a sealed assembly"
         register = HardwareRORegister(self._logger, self,
             address=2 + len(self._registers), shape=signal.shape(), name=signal.name)
-        self._registers.append((register, signal))
+        self._registers.append((register, signal, self._domain))
         return register
 
     def add_rw_register(self, signal) -> AbstractRWRegister:
         assert self._artifact is None, "cannot add a register to a sealed assembly"
         register = HardwareRWRegister(self._logger, self,
             address=2 + len(self._registers), shape=signal.shape(), name=signal.name)
-        self._registers.append((register, signal))
+        self._registers.append((register, signal, self._domain))
         return register
 
-    def add_in_pipe(self, in_stream, *, in_flush=C(1),
+    def add_in_pipe(self, in_stream, *, in_flush=C(0),
                     fifo_depth=None, buffer_size=None) -> AbstractInPipe:
         assert self._artifact is None, "cannot add a pipe to a sealed assembly"
         in_pipe = HardwareInPipe(self._logger, self, buffer_size=buffer_size)
@@ -495,7 +571,7 @@ class HardwareAssembly(AbstractAssembly):
         self._pipes.append(out_pipe)
         return out_pipe
 
-    def add_inout_pipe(self, in_stream, out_stream, *, in_flush=C(1),
+    def add_inout_pipe(self, in_stream, out_stream, *, in_flush=C(0),
                        in_fifo_depth=None, in_buffer_size=None,
                        out_fifo_depth=None, out_buffer_size=None) -> AbstractInOutPipe:
         assert self._artifact is None, "cannot add a pipe to a sealed assembly"
@@ -506,31 +582,17 @@ class HardwareAssembly(AbstractAssembly):
         self._pipes.append(inout_pipe)
         return inout_pipe
 
-    def use_voltage(self, ports: Mapping[GlasgowPort, GlasgowVio | float]):
-        for port, vio in ports.items():
-            port = GlasgowPort(port)
-            if isinstance(vio, float):
-                vio = GlasgowVio(vio)
-            self._logger.debug("setting port %s voltage to %s V", port, vio)
-            self._voltages[port] = vio
+    def set_port_voltage(self, port: GlasgowPort, vio: GlasgowVio):
+        self._logger.debug("setting port %s voltage to %s V", port, vio)
+        self._voltages[port] = vio
 
-    def use_pulls(self, pulls: Mapping[GlasgowPin | tuple[GlasgowPin] | str, PullState | str]):
-        for pins, state in pulls.items():
-            match pins:
-                case str():
-                    pins = GlasgowPin.parse(pins)
-                case GlasgowPin():
-                    pins = [pins]
-            match state:
-                case str():
-                    state = PullState(state)
-            for pin in pins:
-                if pin.invert:
-                    state = ~state
-                if state.enabled():
-                    self._logger.debug("pulling pin %s%s %s%s",
-                        pin.port, pin.number, state, " (inverted)" if pin.invert else "")
-                self._pulls[pin.port, pin.number] = state
+    def set_pin_pull(self, pin: GlasgowPin, state: PullState):
+        if pin.invert:
+            state = ~state
+        if state.enabled():
+            self._logger.debug("pulling pin %s%s %s%s",
+                pin.port, pin.number, state, " (was inverted)" if pin.invert else "")
+        self._pulls[pin.port, pin.number] = state
 
     def artifact(self):
         if self._artifact is not None:
@@ -571,9 +633,9 @@ class HardwareAssembly(AbstractAssembly):
             else:
                 m.submodules[name] = DomainRenamer(domain.name)(elaboratable)
 
-        for register, signal in self._registers:
+        for register, signal, domain in self._registers:
             if isinstance(register, HardwareRWRegister):
-                register_addr = i2c_registers.add_existing_rw(Value.cast(signal))
+                register_addr = i2c_registers.add_existing_rw(Value.cast(signal), domain=domain)
             elif isinstance(register, HardwareRORegister):
                 register_addr = i2c_registers.add_existing_ro(Value.cast(signal))
             assert register_addr == register._address
@@ -582,10 +644,13 @@ class HardwareAssembly(AbstractAssembly):
 
         for idx, (in_ep, (domain, in_stream, in_flush, depth)) in \
                 enumerate(zip(fx2_crossbar.in_eps, self._in_streams)):
-            m.submodules[f"in_fifo_{idx}"] = in_fifo = ResetInserter(in_ep.reset)(
-                StreamFIFO(shape=8, depth=self.DEFAULT_FIFO_DEPTH if depth is None else depth))
-            wiring.connect(m, in_fifo.w, in_stream)
-            wiring.connect(m, in_ep.data, in_fifo.r)
+            if depth == 0:
+                wiring.connect(m, in_ep.data, in_stream)
+            else:
+                m.submodules[f"in_fifo_{idx}"] = in_fifo = ResetInserter(in_ep.reset)(
+                    Queue(shape=8, depth=self.DEFAULT_FIFO_DEPTH if depth is None else depth))
+                wiring.connect(m, in_fifo.i, in_stream)
+                wiring.connect(m, in_ep.data, in_fifo.o)
             m.d.comb += in_ep.flush.eq(in_flush)
             m.d.comb += in_ep.reset.eq(pipe_rst[2 + idx])
             if domain is not None:
@@ -594,10 +659,13 @@ class HardwareAssembly(AbstractAssembly):
 
         for idx, (out_ep, (domain, out_stream, depth)) in \
                 enumerate(zip(fx2_crossbar.out_eps, self._out_streams)):
-            m.submodules[f"out_fifo_{idx}"] = out_fifo = ResetInserter(out_ep.reset)(
-                StreamFIFO(shape=8, depth=self.DEFAULT_FIFO_DEPTH if depth is None else depth))
-            wiring.connect(m, out_fifo.w, out_ep.data)
-            wiring.connect(m, out_stream, out_fifo.r)
+            if depth == 0:
+                wiring.connect(m, out_stream, out_ep.data)
+            else:
+                m.submodules[f"out_fifo_{idx}"] = out_fifo = ResetInserter(out_ep.reset)(
+                    Queue(shape=8, depth=self.DEFAULT_FIFO_DEPTH if depth is None else depth))
+                wiring.connect(m, out_fifo.i, out_ep.data)
+                wiring.connect(m, out_stream, out_fifo.o)
             m.d.comb += out_ep.reset.eq(pipe_rst[idx])
             if domain is not None:
                 with m.If(out_ep.reset):
@@ -666,7 +734,8 @@ class HardwareAssembly(AbstractAssembly):
     async def __aenter__(self):
         return await self.start()
 
-    async def start(self, device=None, *, reload_bitstream=False, _bitstream_file=None):
+    async def start(self, device: Optional[GlasgowDevice] = None, *,
+                    reload_bitstream: bool = False, _bitstream_file: Optional[BinaryIO] = None):
         assert not self._running, "only a stopped assembly can be started"
 
         if self._device is None:
@@ -676,6 +745,8 @@ class HardwareAssembly(AbstractAssembly):
         if self._device is None:
             raise Exception("no device provided")
 
+        await self._device.open()
+
         # Load the bitstream first, since the FX2 needs to be able to access PIPE_RST register.
         if _bitstream_file is not None:
             await self._device.download_prebuilt(self.artifact(), _bitstream_file)
@@ -683,46 +754,52 @@ class HardwareAssembly(AbstractAssembly):
             await self._device.download_target(self.artifact(), reload=reload_bitstream)
 
         if len(self._in_streams) <= 1 and len(self._out_streams) <= 1:
+            # Neither WinUSB, nor libusbK, nor libusb0 allow selecting any configuration other
+            # than the 1st one. This is a limitation of the KMDF USB target. In this case we
+            # fall back to using the configuration with fewer FX2-side buffers.
             try:
-                # Neither WinUSB, nor libusbK, nor libusb0 allow selecting any configuration
-                # that is not the 1st one. This is a limitation of the KMDF USB target.
-                self._device.usb_handle.setConfiguration(2)
-            # Some libusb versions report InvalidParam and some NotSupported.
-            except (usb1.USBErrorInvalidParam, usb1.USBErrorNotSupported):
-                self._device.usb_handle.setConfiguration(1)
+                await self._device.usb_device.select_configuration(2)
+            # `ErrorNotSupported` with libusb backend, `ErrorStall` with webusb backend.
+            except (usb.ErrorNotSupported, usb.ErrorStall):
+                await self._device.usb_device.select_configuration(1)
         elif len(self._in_streams) <= 2 and len(self._out_streams) <= 2:
-            self._device.usb_handle.setConfiguration(1)
+            await self._device.usb_device.select_configuration(1)
         else:
             assert False, "too many pipes"
 
-        active_config = self._device.usb_handle.getConfiguration()
-        for config in self._device.usb_handle.getDevice().iterConfigurations():
-            if config.getConfigurationValue() == active_config:
-                break
-        interfaces = list(config.iterInterfaces())
+        interfaces = self._device.usb_device.configuration.interfaces
 
         in_ifaces = interfaces[len(interfaces) // 2:]
         in_pipes = iter(pipe for pipe in self._pipes if isinstance(pipe, HardwareInPipe))
         for in_iface, in_pipe in zip(in_ifaces, in_pipes):
-            _disabled_setting, enabled_setting = in_iface.iterSettings()
-            in_pipe._in_interface = enabled_setting.getNumber()
-            endpoint, = enabled_setting.iterEndpoints()
-            in_pipe._in_ep_address = endpoint.getAddress()
-            in_pipe._in_packet_size = endpoint.getMaxPacketSize()
+            in_pipe._in_interface = in_iface.number
+            _disabled_setting, enabled_setting = in_iface.alternates
+            endpoint, = enabled_setting.endpoints
+            in_pipe._in_ep_address = endpoint.number
+            in_pipe._in_packet_size = endpoint.packet_size
 
         out_ifaces = interfaces[:len(interfaces) // 2]
         out_pipes = iter(pipe for pipe in self._pipes if isinstance(pipe, HardwareOutPipe))
         for out_iface, out_pipe in zip(out_ifaces, out_pipes):
-            _disabled_setting, enabled_setting = out_iface.iterSettings()
-            out_pipe._out_interface = enabled_setting.getNumber()
-            endpoint, = enabled_setting.iterEndpoints()
-            out_pipe._out_ep_address = endpoint.getAddress()
-            out_pipe._out_packet_size = endpoint.getMaxPacketSize()
+            out_pipe._out_interface = out_iface.number
+            _disabled_setting, enabled_setting = out_iface.alternates
+            endpoint, = enabled_setting.endpoints
+            out_pipe._out_ep_address = endpoint.number
+            out_pipe._out_packet_size = endpoint.packet_size
 
         self._running = True # can access `self.device` after this point
 
-        await self.configure_ports()
+        # Claim all of the interfaces first. On Linux it doesn't matter when this is done, but
+        # on Windows claiming an interface resets all of the other configured interfaces.
+        #
+        # This also means that currently an applet calling `.detach()` will break all of
+        # the other applets, but since the only user of this API, `probe-rs`, isn't able to
+        # attach to the device directly on Windows anyway (due to an nusb bug), this is probably
+        # okay for now.
+        for pipe in self._pipes:
+            await pipe._attach()
 
+        await self.configure_ports()
         for pipe in self._pipes:
             await pipe._start()
 
@@ -734,6 +811,8 @@ class HardwareAssembly(AbstractAssembly):
     async def stop(self):
         for pipe in self._pipes:
             await pipe._stop()
+
+        await self._device.close()
 
         self._running = False
 

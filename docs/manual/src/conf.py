@@ -13,12 +13,32 @@ extensions = [
     "sphinx.ext.todo",
     "sphinx.ext.intersphinx",
     "sphinx.ext.autodoc",
+    "sphinx.ext.napoleon",
     "sphinx_copybutton",
     "sphinx_inline_tabs",
     "sphinxcontrib.autoprogram",
+    "enum_tools.autoenum",
 ]
 
 highlight_language = "text"
+
+rst_prolog = """
+.. role:: py(code)
+   :language: python
+"""
+
+autodoc_member_order = "bysource"
+autodoc_default_options = {
+    "members": True,
+}
+autodoc_preserve_defaults = True
+autodoc_inherit_docstrings = False
+
+napoleon_google_docstring = False
+napoleon_numpy_docstring = True
+napoleon_use_ivar = True
+napoleon_include_init_with_doc = True
+napoleon_include_special_with_doc = True
 
 todo_include_todos = True
 todo_emit_warnings = True
@@ -66,7 +86,7 @@ if is_production:
         },
         "announcement":
             "Production units are being shipped by Mouser. "
-            "<a href='https://crowdsupply.com/1bitsquared/glasgow'>Pre-order yours now!</a>"
+            "<a href='https://crowdsupply.com/1bitsquared/glasgow'>Order yours now!</a>"
     })
 else:
     html_theme_options.update({
@@ -87,12 +107,13 @@ linkcheck_ignore = [
     r"^http://127\.0\.0\.1:8000$",
     # Doesn't like the linkcheck User-Agent.
     r"^https://mouser\.com/",
-    # For unknown reasons, is (mostly) unreachable from GitHub CI runners.
+    # For unknown reasons, these are (mostly) unreachable from GitHub CI runners.
     r"^https://chaos\.social/",
-    # As above.
     r"^https://en\.uesp\.net/",
-    # As above.
     r"^https://www\.gnu\.org/",
+    r"^https://sdcc\.sourceforge\.net/",
+    # Part of applet option help.
+    r"^tcp:",
 ]
 
 linkcheck_anchors_ignore_for_url = [
@@ -101,3 +122,8 @@ linkcheck_anchors_ignore_for_url = [
     # GitHub is a React-based SPA; even README content is included as a JSON payload.
     r"^https://github\.com/",
 ]
+
+# Attempt to keep linkcheck times manageable.
+linkcheck_retries = 5
+linkcheck_timeout = 5
+linkcheck_workers = 50

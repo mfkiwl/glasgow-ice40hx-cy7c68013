@@ -1,17 +1,18 @@
+from typing import Literal, Optional, Tuple
 import os
 import sys
 import logging
 import asyncio
-import typing
 from amaranth import *
 from amaranth.lib import wiring, stream, io
 from amaranth.lib.wiring import In, Out
 
-from ....support.arepl import AsyncInteractiveConsole
-from ....support.logging import dump_hex
-from ....support.endpoint import ServerEndpoint
-from ....gateware.uart import UART
-from ... import GlasgowAppletV2
+from glasgow.support.arepl import AsyncInteractiveConsole
+from glasgow.support.logging import dump_hex
+from glasgow.support.endpoint import ServerEndpoint
+from glasgow.gateware.uart import UART
+from glasgow.abstract import AbstractAssembly, GlasgowPin
+from glasgow.applet import GlasgowAppletV2
 
 
 class UARTAutoBaud(wiring.Component):
@@ -99,9 +100,10 @@ class UARTComponent(wiring.Component):
     use_auto:   In(1)
     manual_cyc: In(20)
     auto_cyc:   Out(20)
-
     bit_cyc:    Out(20)
-    rx_errors:  Out(16)
+
+    rx_errors:   Out(16)
+    rx_overflow: Out(16)
 
     def __init__(self, ports, *, parity: str):
         self.ports  = ports
@@ -133,6 +135,9 @@ class UARTComponent(wiring.Component):
         with m.If(uart.rx_ferr | uart.rx_perr):
             m.d.sync += self.rx_errors.eq(self.rx_errors + 1)
 
+        with m.If(uart.rx_ovf):
+            m.d.sync += self.rx_overflow.eq(self.rx_overflow + 1)
+
         m.d.comb += [
             uart.tx_data.eq(self.i_stream.payload),
             uart.tx_ack.eq(self.i_stream.valid),
@@ -146,7 +151,9 @@ class UARTComponent(wiring.Component):
 
 
 class UARTInterface:
-    def __init__(self, logger, assembly, *, rx, tx, parity="none"):
+    def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
+                 rx: Optional[GlasgowPin], tx: Optional[GlasgowPin],
+                 parity: Literal["none", "zero", "one", "odd", "even"] = "none"):
         self._logger = logger
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
 
@@ -158,7 +165,8 @@ class UARTInterface:
         self._manual_cyc = assembly.add_rw_register(component.manual_cyc)
         self._auto_cyc   = assembly.add_ro_register(component.auto_cyc)
         self._bit_cyc    = assembly.add_ro_register(component.bit_cyc)
-        self._rx_errors  = assembly.add_ro_register(component.rx_errors)
+        self._rx_errors   = assembly.add_ro_register(component.rx_errors)
+        self._rx_overflow = assembly.add_ro_register(component.rx_overflow)
         self._sys_clk_period = assembly.sys_clk_period
 
     def _log(self, message, *args):
@@ -186,7 +194,7 @@ class UARTInterface:
         await self._use_auto.set(1)
 
     async def read(self, length: int, *, flush=True) -> memoryview:
-        """Reads one or more bytes from the UART. If ``flush`` is true, transmits any buffered
+        """Reads one or more bytes from the UART. If :py:`flush` is true, transmits any buffered
         writes before starting to receive."""
         self._log("rx len=%d", length)
         if flush:
@@ -196,7 +204,7 @@ class UARTInterface:
         return data
 
     async def read_all(self, *, flush=True) -> memoryview:
-        """Reads all buffered bytes from the UART, but no less than one byte. If ``flush`` is
+        """Reads all buffered bytes from the UART, but no less than one byte. If :py:`flush` is
         true, transmits any buffered writes before starting to read."""
         self._log("rx all")
         if flush:
@@ -208,8 +216,8 @@ class UARTInterface:
         self._log("rx data=<%s>", dump_hex(data))
         return data
 
-    async def read_until(self, trailer: bytes | typing.Tuple[bytes, ...]) -> memoryview:
-        """Reads bytes from the UART until ``trailer``, which can be a single byte sequence
+    async def read_until(self, trailer: bytes | Tuple[bytes, ...]) -> memoryview:
+        """Reads bytes from the UART until :py:`trailer`, which can be a single byte sequence
         or a choice of multiple byte sequences, is encountered. The return value includes
         the trailer."""
         buffer = bytearray()
@@ -233,21 +241,28 @@ class UARTInterface:
 
     async def monitor(self, *, interval=1.0):
         """Logs receive errors and automatic baud rate changes."""
-        cur_errors = 0
-        cur_baud = await self.get_baud()
-        while True:
-            new_errors = await self._rx_errors
-            delta = new_errors - cur_errors
-            if new_errors < cur_errors:
-                delta += 1 << 16
-            if delta > 0:
-                self._logger.warning("%d receive errors detected", delta)
-            cur_errors = new_errors
 
+        def check_counter(cur_value, new_value):
+            delta = new_value - cur_value
+            if new_value < cur_value:
+                delta += 1 << 16
+            return new_value, delta
+
+        cur_baud = await self.get_baud()
+        cur_errors = cur_overflow = 0
+        while True:
             new_baud = await self.get_baud()
             if new_baud != cur_baud:
                 self._logger.info("switched to %d baud", await self.get_baud())
             cur_baud = new_baud
+
+            cur_errors, delta = check_counter(cur_errors, await self._rx_errors)
+            if delta > 0:
+                self._logger.warning("%d frames dropped due to frame/parity errors", delta)
+
+            cur_overflow, delta = check_counter(cur_overflow, await self._rx_overflow)
+            if delta > 0:
+                self._logger.warning("%d frames dropped due to overflow", delta)
 
             await asyncio.sleep(interval)
 
@@ -316,23 +331,25 @@ class UARTApplet(GlasgowAppletV2):
             "socket", help="connect UART to a socket")
         ServerEndpoint.add_argument(p_socket, "endpoint")
 
-    async def _forward_fd(self, args, in_fileno, out_fileno, quit_sequence=False):
+    async def _forward_fd(self, in_fileno, out_fileno, *, stream=False):
         async def forward_out():
             quit = 0
             while True:
                 data = await asyncio.get_event_loop().run_in_executor(None,
                     lambda: os.read(in_fileno, 1024))
-                if len(data) == 0 and not args.stream:
+                if len(data) == 0 and not stream:
                     raise EOFError
 
                 if os.isatty(in_fileno):
-                    if quit == 0 and data == b"\034":
-                        quit = 1
-                        continue
-                    elif quit == 1 and data == b"q":
-                        raise EOFError
-                    else:
-                        quit = 0
+                    match (quit, data):
+                        case (0, b"~"):
+                            quit = 1
+                            continue
+                        case (1, b"."):
+                            raise EOFError
+                        case (1, _):
+                            quit = 0
+                            data = b"~" + data
 
                 await self.uart_iface.write(data, flush=True)
 
@@ -350,7 +367,7 @@ class UARTApplet(GlasgowAppletV2):
         except* EOFError:
             pass
 
-    async def _run_tty(self, args):
+    async def _run_tty(self, *, stream):
         in_fileno  = sys.stdin.fileno()
         out_fileno = sys.stdout.fileno()
 
@@ -365,25 +382,25 @@ class UARTApplet(GlasgowAppletV2):
             new_stdin_attrs = [iflag, oflag, cflag, lflag, ispeed, ospeed, cc]
             termios.tcsetattr(in_fileno, termios.TCSADRAIN, new_stdin_attrs)
 
-            self.logger.info("running on a TTY; enter `Ctrl+\\ q` to quit")
+            self.logger.info("running on a TTY; enter `~` then `.` to quit")
             try:
-                await self._forward_fd(args, in_fileno, out_fileno, quit_sequence=True)
+                await self._forward_fd(in_fileno, out_fileno, stream=stream)
             finally:
                 termios.tcsetattr(in_fileno, termios.TCSADRAIN, old_stdin_attrs)
 
         else:
-            await self._forward_fd(args, in_fileno, out_fileno)
+            await self._forward_fd(in_fileno, out_fileno, stream=stream)
 
-    async def _run_pty(self, args):
+    async def _run_pty(self):
         import pty
 
-        master, slave = pty.openpty()
-        print(os.ttyname(slave))
+        primary, secondary = pty.openpty()
+        print(os.ttyname(secondary))
 
-        await self._forward_fd(args, in_fileno=master, out_fileno=master)
+        await self._forward_fd(in_fileno=primary, out_fileno=primary)
 
-    async def _run_socket(self, args):
-        endpoint = await ServerEndpoint("socket", self.logger, args.endpoint)
+    async def _run_socket(self, sock_addr):
+        endpoint = await ServerEndpoint("socket", self.logger, sock_addr)
 
         async def forward_out():
             while True:
@@ -405,19 +422,14 @@ class UARTApplet(GlasgowAppletV2):
 
     async def run(self, args):
         match args.operation:
-            case "tty" | None:
-                await self._run_tty(args)
+            case None:
+                await self._run_tty(stream=False)
+            case "tty":
+                await self._run_tty(stream=args.stream)
             case "pty":
-                await self._run_pty(args)
+                await self._run_pty()
             case "socket":
-                await self._run_socket(args)
-
-    async def repl(self, args):
-        self.logger.info("dropping to REPL; use 'help(iface)' to see available APIs")
-        await AsyncInteractiveConsole(
-            locals={"iface": self.uart_iface},
-            run_callback=self.assembly.flush
-        ).interact()
+                await self._run_socket(args.endpoint)
 
     @classmethod
     def tests(cls):

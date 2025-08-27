@@ -14,13 +14,13 @@ class UARTBus(Elaboratable):
     """
     def __init__(self, ports):
         self.ports = ports
-        
+
         self.has_rx = self.has_tx = False
         if hasattr(ports, "rx"):
             if ports.rx is not None:
                 self.has_rx = True
                 self.rx_i = Signal()
-        
+
         if hasattr(ports, "tx"):
             if ports.tx is not None:
                 self.has_tx = True
@@ -126,12 +126,13 @@ class UART(Elaboratable):
             elif kind == "one":
                 return C(1, 1)
             else:
-                bits, _ = sig.shape()
-                even_parity = sum([sig[b] for b in range(bits)]) & 1
+                # odd or even parity includes the parity bit; since `xor()`
+                # calculates odd parity, invert that to get its expected value
+                parity_bit = ~sig.xor()
                 if kind == "odd":
-                    return ~even_parity
+                    return parity_bit
                 elif kind == "even":
-                    return even_parity
+                    return ~parity_bit
                 else:
                     assert False
 
@@ -154,7 +155,6 @@ class UART(Elaboratable):
 
             with m.FSM():
                 with m.State("IDLE"):
-                    m.d.sync += self.rx_rdy.eq(0),
                     with m.If(~self.bus.rx_i):
                         m.d.comb += rx_start.eq(1)
                         m.next = "START"
@@ -189,7 +189,7 @@ class UART(Elaboratable):
                             m.d.sync += self.rx_data.eq(rx_shreg)
                             m.next = "READY"
                 with m.State("READY"):
-                    m.d.sync += self.rx_rdy.eq(1)
+                    m.d.comb += self.rx_rdy.eq(1)
                     with m.If(self.rx_ack):
                         m.next = "IDLE"
                     with m.Elif(~self.bus.rx_i):

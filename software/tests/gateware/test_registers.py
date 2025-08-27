@@ -18,6 +18,9 @@ class I2CRegistersTestbench(Elaboratable):
         self.reg_ro_16, self.addr_ro_16 = self.dut.add_ro(16)
         self.reg_rw_12, self.addr_rw_12 = self.dut.add_rw(12)
         self.reg_ro_12, self.addr_ro_12 = self.dut.add_ro(12)
+        self.cd_app = ClockDomain()
+        self.reg_app = Signal(8)
+        self.addr_app = self.dut.add_existing_rw(self.reg_app, domain=self.cd_app)
 
     def elaborate(self, platform):
         m = Module()
@@ -58,9 +61,10 @@ class I2CRegistersTestCase(unittest.TestCase):
         self.assertEqual((yield from tb.i2c.read_bit()), 0)
         yield from tb.i2c.write_octet(0b10100101)
         self.assertEqual((yield from tb.i2c.read_bit()), 0)
+        self.assertEqual((yield tb.dut.regs_r[self.tb.addr_rw_8]), 0)
+        yield from tb.i2c.stop()
         self.assertEqual((yield tb.dut.regs_r[self.tb.addr_rw_8]), 0b10100101)
         self.assertEqual((yield tb.dut.regs_r[self.tb.addr_dummy]), 0b00000000)
-        yield from tb.i2c.stop()
 
     @simulation_test
     def test_data_read_8(self, tb):
@@ -86,10 +90,12 @@ class I2CRegistersTestCase(unittest.TestCase):
         self.assertEqual((yield from tb.i2c.read_bit()), 0)
         yield from tb.i2c.write_octet(0b11110000)
         self.assertEqual((yield from tb.i2c.read_bit()), 0)
+        self.assertEqual((yield tb.dut.regs_r[self.tb.addr_rw_16]), 0)
         yield from tb.i2c.write_octet(0b10100101)
         self.assertEqual((yield from tb.i2c.read_bit()), 0)
-        self.assertEqual((yield tb.dut.regs_r[self.tb.addr_rw_16]), 0b1111000010100101)
+        self.assertEqual((yield tb.dut.regs_r[self.tb.addr_rw_16]), 0)
         yield from tb.i2c.stop()
+        self.assertEqual((yield tb.dut.regs_r[self.tb.addr_rw_16]), 0b1111000010100101)
 
     @simulation_test
     def test_data_read_16(self, tb):
@@ -117,10 +123,12 @@ class I2CRegistersTestCase(unittest.TestCase):
         self.assertEqual((yield from tb.i2c.read_bit()), 0)
         yield from tb.i2c.write_octet(0b00001110)
         self.assertEqual((yield from tb.i2c.read_bit()), 0)
+        self.assertEqual((yield tb.dut.regs_r[self.tb.addr_rw_12]), 0)
         yield from tb.i2c.write_octet(0b10100101)
         self.assertEqual((yield from tb.i2c.read_bit()), 0)
-        self.assertEqual((yield tb.dut.regs_r[self.tb.addr_rw_12]), 0b111010100101)
+        self.assertEqual((yield tb.dut.regs_r[self.tb.addr_rw_12]), 0)
         yield from tb.i2c.stop()
+        self.assertEqual((yield tb.dut.regs_r[self.tb.addr_rw_12]), 0b111010100101)
 
     @simulation_test
     def test_data_read_12(self, tb):
@@ -138,3 +146,20 @@ class I2CRegistersTestCase(unittest.TestCase):
         self.assertEqual((yield from tb.i2c.read_octet()), 0b00001110)
         yield from tb.i2c.write_bit(1)
         yield from tb.i2c.stop()
+
+    @simulation_test
+    def test_data_write_rst(self, tb):
+        yield from tb.i2c.start()
+        yield from tb.i2c.write_octet(0b00010000)
+        self.assertEqual((yield from tb.i2c.read_bit()), 0)
+        yield from tb.i2c.write_octet(self.tb.addr_app)
+        self.assertEqual((yield from tb.i2c.read_bit()), 0)
+        yield from tb.i2c.write_octet(0b10100101)
+        self.assertEqual((yield from tb.i2c.read_bit()), 0)
+        yield from tb.i2c.stop()
+        self.assertEqual((yield tb.reg_app), 0b10100101)
+        yield tb.cd_app.rst.eq(1)
+        yield
+        yield tb.cd_app.rst.eq(0)
+        yield
+        self.assertEqual((yield tb.reg_app), 0)

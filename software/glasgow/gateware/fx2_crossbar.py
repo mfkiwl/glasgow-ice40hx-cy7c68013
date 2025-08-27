@@ -146,7 +146,7 @@ from amaranth import *
 from amaranth.lib import wiring, stream, io
 from amaranth.lib.wiring import In, Out, connect, flipped
 
-from .stream import StreamFIFO
+from .stream import SkidBuffer
 
 
 __all__ = ["FX2Crossbar"]
@@ -179,6 +179,20 @@ class _INFIFO(wiring.Component):
 
         connect(m, flipped(self.r), flipped(self.w))
 
+        # Flush the incomplete packet after 1 microframe (125 µs) of inactivity. The host will poll
+        # us at least once per microframe in most conditions; therefore there is little advantage
+        # in holding onto the incomplete packet. Having fewer non-maximum-length packets sent means
+        # fewer URBs serviced (good), but having data remain in the hardware buffers for longer
+        # than necessary means confused applet authors (very bad).
+        timer = Signal(16, init=int(125e-6 * platform.default_clk_frequency))
+        timeout = Signal()
+        with m.If(self.w.valid):
+            m.d.sync += timer.eq(timer.init)
+        with m.Elif(timer != 0):
+            m.d.sync += timer.eq(timer - 1)
+        with m.Else():
+            m.d.comb += timeout.eq(1)
+
         pending = Signal()
         with m.If(self.flushed):
             m.d.sync += self.queued.eq(0)
@@ -193,7 +207,7 @@ class _INFIFO(wiring.Component):
 
         m.d.comb += [
             self.complete.eq(self.queued >= _PACKET_SIZE),
-            self.pending.eq(pending & self.flush),
+            self.pending.eq(pending & (timeout | self.flush)),
         ]
 
         return m
@@ -219,14 +233,9 @@ class _OUTFIFO(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.skid = skid = StreamFIFO(shape=8, depth=self._skid_depth, buffered=False)
-
-        m.d.comb += skid.w.payload.eq(self.w.payload)
-        m.d.comb += skid.w.valid.eq(self.w.valid & (~self.r.ready | skid.r.valid))
-        with m.If(skid.r.valid):
-            connect(m, flipped(self.r), skid.r)
-        with m.Else():
-            connect(m, flipped(self.r), flipped(self.w))
+        m.submodules.skid = skid = SkidBuffer(shape=8, depth=self._skid_depth)
+        connect(m, skid.i, flipped(self.w))
+        connect(m, flipped(self.r), skid.o)
 
         return m
 
@@ -316,11 +325,11 @@ class FX2Crossbar(wiring.Component):
     in_eps: Out(wiring.Signature({
         "data":  In(stream.Signature(8)),
         "flush": In(1),
-        "reset": In(1, reset=1),
+        "reset": In(1, init=1),
     })).array(2)
     out_eps: Out(wiring.Signature({
         "data":  Out(stream.Signature(8)),
-        "reset": In(1, reset=1),
+        "reset": In(1, init=1),
     })).array(2)
 
     def __init__(self, pads):

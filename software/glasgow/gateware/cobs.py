@@ -1,9 +1,18 @@
 from amaranth import *
 from amaranth.lib import data, wiring, memory, stream
 from amaranth.lib.stream import In, Out
+from cobs import cobs
+
+from .stream import StreamBuffer
 
 
-__all__ = ["Encoder", "Decoder"]
+__all__ = ["Encoder", "Decoder", "encode", "decode"]
+
+
+# Re-export from the `cobs` PyPI package.
+encode = cobs.encode
+decode = cobs.decode
+DecodeError = cobs.DecodeError
 
 
 class Encoder(wiring.Component):
@@ -57,15 +66,17 @@ class Encoder(wiring.Component):
 
         w_addr = Signal.like(w_port.addr)
         r_addr = Signal.like(r_port.addr)
-        empty  = (w_addr == r_addr)
-        full   = (w_addr == r_addr - 1)
+        staged = Signal(8, init=1)
+
+        empty  = Signal()
+        full   = Signal()
+        m.d.comb += empty.eq(r_addr == w_addr)
+        m.d.comb += full.eq(r_addr == (w_addr + staged)[:len(r_addr)])
 
         def write(at, data):
             m.d.comb += w_port.addr.eq(at)
             m.d.comb += w_port.data.eq(data)
             m.d.comb += w_port.en.eq(1)
-
-        staged = Signal(8, init=1)
 
         def stage(data):
             write(w_addr + staged, data)
@@ -112,7 +123,7 @@ class Encoder(wiring.Component):
 class Decoder(wiring.Component):
     """`Consistent Overhead Byte Stuffing <cobs>`_ decoder.
 
-    Performs an inversion of the transformation done by :class:`Encoder` with a fixed 0 cycle
+    Performs an inversion of the transformation done by :class:`Encoder` with a fixed 1 cycle
     latency.
 
     If invalid COBS data is encountered (namely: if a group header byte or data byte is NUL),
@@ -135,6 +146,9 @@ class Decoder(wiring.Component):
         count  = Signal(8)
         offset = Signal(8)
 
+        m.submodules.buffer = buffer = StreamBuffer(self.o.p.shape())
+        wiring.connect(m, wiring.flipped(self.o), buffer.o)
+
         with m.FSM():
             with m.State("Start"):
                 m.d.comb += self.i.ready.eq(1)
@@ -147,23 +161,23 @@ class Decoder(wiring.Component):
                         m.next = "Error"
 
             with m.State("Data"):
-                m.d.comb += self.i.ready.eq(self.o.ready)
+                m.d.comb += self.i.ready.eq(buffer.i.ready)
                 with m.If(self.i.valid & self.i.ready):
                     with m.If(offset == count):
                         m.d.sync += count.eq(1)
                         with m.If(self.i.payload == 0x00):
-                            m.d.comb += self.o.payload.end.eq(1)
-                            m.d.comb += self.o.valid.eq(1)
+                            m.d.comb += buffer.i.payload.end.eq(1)
+                            m.d.comb += buffer.i.valid.eq(1)
                             m.next = "Start"
                         with m.Else():
-                            m.d.comb += self.o.payload.data.eq(0x00)
-                            m.d.comb += self.o.valid.eq(offset != 0xff)
+                            m.d.comb += buffer.i.payload.data.eq(0x00)
+                            m.d.comb += buffer.i.valid.eq(offset != 0xff)
                             m.d.sync += offset.eq(self.i.payload)
                     with m.Else():
                         m.d.sync += count.eq(count + 1)
                         with m.If(self.i.payload != 0x00):
-                            m.d.comb += self.o.payload.data.eq(self.i.payload)
-                            m.d.comb += self.o.valid.eq(1)
+                            m.d.comb += buffer.i.payload.data.eq(self.i.payload)
+                            m.d.comb += buffer.i.valid.eq(1)
                         with m.Else():
                             m.next = "Error"
 

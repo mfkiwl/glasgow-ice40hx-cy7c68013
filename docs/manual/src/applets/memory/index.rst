@@ -6,6 +6,7 @@ Memory manipulation
 .. automodule:: glasgow.applet.memory
 
 .. toctree::
-    :maxdepth: 2
+    :maxdepth: 3
 
+    24x
     25x

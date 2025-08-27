@@ -5,11 +5,11 @@ import argparse
 from amaranth import *
 from amaranth.lib import enum, data, wiring, stream, io, cdc
 from amaranth.lib.wiring import In, Out
-from cobs.cobs import decode as cobs_decode
 
 from glasgow.support.logging import dump_hex
-from glasgow.gateware.stream import StreamFIFO
-from glasgow.gateware.cobs import Encoder as COBSEncoder
+from glasgow.gateware.stream import AsyncQueue
+from glasgow.gateware import cobs
+from glasgow.abstract import AbstractAssembly, GlasgowPin
 from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
 
 
@@ -65,39 +65,39 @@ class SPIAnalyzerFrontend(wiring.Component):
         m.domains.fifo = cd_fifo = ClockDomain(reset_less=True, local=True)
         m.d.comb += cd_fifo.clk.eq(sck_buffer.i)
 
-        m.submodules.fifo = fifo = StreamFIFO(
+        m.submodules.fifo = fifo = AsyncQueue(
             shape=self.stream.p.shape(),
             depth=4, # CDC only, no buffering
-            w_domain="fifo",
-            r_domain="sync"
+            i_domain="fifo",
+            o_domain="sync"
         )
 
         for index, chip in enumerate(cs_buffer.i):
             with m.If(~chip):
-                m.d.comb += fifo.w.p.chip.eq(index)
+                m.d.comb += fifo.i.p.chip.eq(index)
 
         copi_shreg = Signal(self._word_width)
         cipo_shreg = Signal(self._word_width)
         m.d.fifo += copi_shreg.eq(Cat(copi_buffer.i, copi_shreg))
         m.d.fifo += cipo_shreg.eq(Cat(cipo_buffer.i, cipo_shreg))
-        m.d.comb += fifo.w.p.copi.eq(Cat(copi_buffer.i, copi_shreg))
-        m.d.comb += fifo.w.p.cipo.eq(Cat(cipo_buffer.i, cipo_shreg))
+        m.d.comb += fifo.i.p.copi.eq(Cat(copi_buffer.i, copi_shreg))
+        m.d.comb += fifo.i.p.cipo.eq(Cat(cipo_buffer.i, cipo_shreg))
 
         start = Signal(init=1)
         count = Signal(range(self._word_width), init=2) # 2 is the ResetSynchronizer latency
-        m.d.comb += fifo.w.p.start.eq(start)
+        m.d.comb += fifo.i.p.start.eq(start)
         with m.If(count == self._word_width - 1):
-            m.d.comb += fifo.w.valid.eq(1)
+            m.d.comb += fifo.i.valid.eq(1)
             m.d.spi += start.eq(0)
             m.d.spi += count.eq(0)
         with m.Else():
             m.d.spi += count.eq(count + 1)
 
         overflow_spi  = Signal()
-        with m.If(fifo.w.valid & ~fifo.w.ready):
+        with m.If(fifo.i.valid & ~fifo.i.ready):
             m.d.spi += overflow_spi.eq(1)
 
-        wiring.connect(m, wiring.flipped(self.stream), fifo.r)
+        wiring.connect(m, wiring.flipped(self.stream), fifo.o)
 
         cs_sync = Signal()
         # Note that the async FIFO write-to-read latency, and the latency of this synchronizer,
@@ -106,7 +106,7 @@ class SPIAnalyzerFrontend(wiring.Component):
         # indefinitely because there is no end marker. Back-to-back transfers may not ever cause
         # the `complete` output to be asserted.
         m.submodules.cs_sync = cdc.FFSynchronizer(cs_buffer.i.all(), cs_sync)
-        with m.If(cs_sync & ~fifo.r.valid):
+        with m.If(cs_sync & ~fifo.o.valid):
             m.d.comb += self.complete.eq(1)
 
         overflow_sync = Signal()
@@ -119,7 +119,6 @@ class SPIAnalyzerFrontend(wiring.Component):
 
 class SPIAnalyzerComponent(wiring.Component):
     o_stream: Out(stream.Signature(8))
-    o_flush:  Out(1)
 
     overflow: Out(1)
 
@@ -132,13 +131,12 @@ class SPIAnalyzerComponent(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.encoder  = encoder  = COBSEncoder(fifo_depth=self._buffer_size)
+        m.submodules.encoder  = encoder  = cobs.Encoder(fifo_depth=self._buffer_size)
         wiring.connect(m, wiring.flipped(self.o_stream), encoder.o)
 
         m.submodules.frontend = frontend = SPIAnalyzerFrontend(self._ports)
 
-        idle  = Signal(init=1)
-        timer = Signal(20)
+        idle = Signal(init=1)
         with m.FSM():
             with m.State("Idle"):
                 with m.If(frontend.stream.valid):
@@ -146,12 +144,6 @@ class SPIAnalyzerComponent(wiring.Component):
                     m.d.comb += encoder.i.valid.eq(1)
                     with m.If(encoder.i.ready):
                         m.next = "COPI"
-                # FIXME: this timeout should be a part of the common FX2 logic
-                with m.Else():
-                    with m.If(timer == 0):
-                        m.d.comb += self.o_flush.eq(1)
-                    with m.Else():
-                        m.d.sync += timer.eq(timer - 1)
 
             with m.State("COPI"):
                 with m.If(frontend.stream.valid):
@@ -178,9 +170,6 @@ class SPIAnalyzerComponent(wiring.Component):
                 m.d.comb += encoder.i.valid.eq(1)
                 with m.If(encoder.i.ready):
                     m.d.sync += idle.eq(1)
-                    # FIXME: not the most elegant approach to make the timeout shorter
-                    # during simulation
-                    m.d.sync += timer.eq(1000 if platform is None else ~0)
                     m.next = "Idle"
 
         m.d.comb += self.overflow.eq(frontend.overflow)
@@ -189,38 +178,36 @@ class SPIAnalyzerComponent(wiring.Component):
 
 
 class SPIAnalyzerInterface:
-    def __init__(self, logger, assembly, *, cs, sck, copi, cipo, buffer_size=512):
+    def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
+                 cs: GlasgowPin, sck: GlasgowPin, copi: GlasgowPin, cipo: GlasgowPin,
+                 buffer_size=512):
         self._logger = logger
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
 
         ports = assembly.add_port_group(cs=cs, sck=sck, copi=copi, cipo=cipo)
         component = assembly.add_submodule(SPIAnalyzerComponent(ports, buffer_size))
-        # Use only a minimal interface FIFO; most of the buffering is done in the COBS encoder.
-        self._pipe = assembly.add_in_pipe(
-            component.o_stream, in_flush=component.o_flush, fifo_depth=4)
+        # Don't use an interface FIFO; the input buffering is done in the COBS encoder.
+        self._pipe = assembly.add_in_pipe(component.o_stream, fifo_depth=0)
         self._overflow = assembly.add_ro_register(component.overflow)
-
-        self._buffer  = bytearray()
-        self._packets = []
 
     def _log(self, message, *args):
         self._logger.log(self._level, "SPI analyzer: " + message, *args)
 
-    async def _recv_packet(self) -> bytes:
-        while not self._packets:
-            if self._pipe.readable == 0 and await self._overflow:
-                raise SPIAnalyzerOverflow("overflow")
+    async def capture(self) -> tuple[int, bytes, bytes]:
+        """Capture a transaction.
 
-            self._buffer += await self._pipe.recv(self._pipe.readable or 1)
-            if b"\x00" in self._buffer:
-                *self._packets, self._buffer = self._buffer.split(b"\x00")
+        Returns a 3-tuple :py:`(chip, copi, cipo)`, where :py:`chip` is the chip select index,
+        :py:`copi` are bytes transmitted from controller to peripheral, and :py:`cipo` are bytes
+        transmitted from peripheral to controller.
 
-        packet = self._packets[0]
-        del self._packets[0]
-        return cobs_decode(packet)
+        Raises
+        ------
+        SPIAnalyzerOverflow
+            When the FPGA buffer overflows. The last few transactions before the overflow occurred
+            may be dropped as well.
+        """
 
-    async def capture(self) -> tuple[bytes, bytes]:
-        packet = await self._recv_packet()
+        packet = cobs.decode((await self._pipe.recv_until(b"\0"))[:-1])
         chip, copi_data, cipo_data = packet[0], packet[1::2], packet[2::2]
         self._log("capture chip=%d copi=<%s> cipo=<%s>",
             chip, dump_hex(copi_data), dump_hex(cipo_data))
@@ -248,7 +235,6 @@ class SPIAnalyzerApplet(GlasgowAppletV2):
     * ``<COPI>,<CIPO>``, where <COPI> and <CIPO> are hexadecimal byte sequences with each eight
       bits corresponding to samples of COPI and CIPO, respectively (from MSB to LSB); this format
       is used if one CS# pin is provided.
-
     * ``<CS>,<COPI>,<CIPO>``, where <CS> is a 0-based CS# pin index and <COPI> and <CIPO> are
       the same as above; this format is used if multiple CS# pins are provided.
 

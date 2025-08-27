@@ -1,7 +1,6 @@
 from abc import ABCMeta, abstractmethod
 import asyncio
 
-import usb1
 from amaranth import *
 from amaranth import Module, ResetInserter, Signal
 from amaranth.lib import wiring, stream, io
@@ -9,7 +8,6 @@ from amaranth.lib import wiring, stream, io
 from .support.chunked_fifo import ChunkedFIFO
 from .support.logging import dump_hex
 from .support.task_queue import TaskQueue
-from .gateware.stream import StreamFIFO
 from .gateware.ports import PortGroup
 from .hardware.platform import GlasgowPlatformPort
 

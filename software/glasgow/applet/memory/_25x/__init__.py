@@ -256,9 +256,9 @@ class Memory25xApplet(GlasgowAppletV2):
     to connect the memory with probes or, alternatively, crimp an IDC cable wired to a SOIC clip.
 
     It is also possible to flash 25-series flash chips using the `spi-flashrom` applet, which
-    requires a third-party tool `flashrom`.
-    The advantage of using the `spi-flashrom` applet is that flashrom offers compatibility with
-    a wider variety of devices, some of which may not be supported by the `memory-25x` applet.
+    requires a third-party tool `flashrom`. The advantage of using the `flashrom` applet is that
+    flashrom offers compatibility with a wider variety of devices, some of which may not be
+    supported by the `memory-25x` applet.
     """
     required_revision = QSPIControllerApplet.required_revision
 
@@ -283,7 +283,7 @@ class Memory25xApplet(GlasgowAppletV2):
             help="set SCK frequency to FREQ kHz (default: %(default)s)")
 
     async def setup(self, args):
-        await self.m25x_iface.qspi.set_sck_freq(args.frequency * 1000)
+        await self.m25x_iface.qspi.clock.set_frequency(args.frequency * 1000)
 
     @classmethod
     def add_run_arguments(cls, parser):

@@ -14,6 +14,9 @@ from ..abstract import *
 __all__ = ["SimulationPipe", "SimulationRegister", "SimulationAssembly"]
 
 
+logger = logging.getLogger(__name__)
+
+
 class SimulationPipe(AbstractInOutPipe):
     def __init__(self, parent, *, i_buffer, o_buffer):
         self._parent   = parent
@@ -31,7 +34,18 @@ class SimulationPipe(AbstractInOutPipe):
             assert not rst_hit
         data = self._i_buffer[:length]
         del self._i_buffer[:length]
-        return data
+        return memoryview(data)
+
+    async def recv_until(self, delimiter: bytes) -> bytes:
+        assert self._i_buffer is not None, "recv_until() called on an out pipe"
+        assert len(delimiter) >= 1
+        while delimiter not in self._i_buffer:
+            clk_hit, rst_hit = await self._parent._context.tick()
+            assert not rst_hit
+        length = self._i_buffer.index(delimiter) + len(delimiter)
+        data = self._i_buffer[:length]
+        del self._i_buffer[:length]
+        return bytes(data)
 
     @property
     def writable(self) -> Optional[int]:
@@ -51,6 +65,9 @@ class SimulationPipe(AbstractInOutPipe):
         self._i_buffer.clear()
         self._o_buffer.clear()
 
+    async def detach(self) -> tuple[int, int]:
+        raise NotImplementedError
+
 
 class SimulationRORegister(AbstractRORegister):
     def __init__(self, parent, signal):
@@ -60,6 +77,10 @@ class SimulationRORegister(AbstractRORegister):
     async def get(self):
         return self._parent._context.get(self._signal)
 
+    @property
+    def shape(self):
+        return self._signal.shape()
+
 
 class SimulationRWRegister(SimulationRORegister, AbstractRWRegister):
     async def set(self, value):
@@ -68,6 +89,7 @@ class SimulationRWRegister(SimulationRORegister, AbstractRWRegister):
 
 class SimulationAssembly(AbstractAssembly):
     def __init__(self):
+        self._logger   = logger
         self._pins     = {} # {name: io.PortLike}
         self._modules  = [] # (elaboratable, name)
         self._benches  = [] # (constructor, background)
@@ -81,7 +103,11 @@ class SimulationAssembly(AbstractAssembly):
 
     @contextmanager
     def add_applet(self, applet: Any) -> Generator[None, None, None]:
-        yield
+        self._logger = applet.logger
+        try:
+            yield
+        finally:
+            self._logger = logger
 
     def add_platform_pin(self, pin: GlasgowPin, port_name: str) -> io.PortLike:
         pin_name = f"{pin.port}{pin.number}"
@@ -89,13 +115,13 @@ class SimulationAssembly(AbstractAssembly):
         self._pins[pin_name] = port
         return port
 
-    def get_pin(self, pin_name):
+    def get_pin(self, pin_name: str) -> io.SimulationPort:
         return self._pins[pin_name]
 
-    def connect_pins(self, *pin_names):
+    def connect_pins(self, *pin_names: str):
         self._jumpers.append(pin_names)
 
-    def add_in_pipe(self, in_stream, *, in_flush=C(1),
+    def add_in_pipe(self, in_stream, *, in_flush=C(0),
                     fifo_depth=None, buffer_size=None) -> AbstractInPipe:
         return self.add_inout_pipe(
             in_stream=in_stream, out_stream=None, in_flush=in_flush,
@@ -107,7 +133,7 @@ class SimulationAssembly(AbstractAssembly):
             in_stream=None, out_stream=out_stream,
             out_fifo_depth=fifo_depth, out_buffer_size=buffer_size)
 
-    def add_inout_pipe(self, in_stream, out_stream, *, in_flush=C(1),
+    def add_inout_pipe(self, in_stream, out_stream, *, in_flush=C(0),
                        in_fifo_depth=None, in_buffer_size=None,
                        out_fifo_depth=None, out_buffer_size=None) -> AbstractInOutPipe:
         if in_stream is None:
@@ -116,6 +142,7 @@ class SimulationAssembly(AbstractAssembly):
             i_buffer = bytearray()
             async def i_testbench(ctx):
                 nonlocal i_buffer
+                timer = 0
                 packet = bytearray()
                 ctx.set(in_stream.ready, 1)
                 while True:
@@ -125,9 +152,12 @@ class SimulationAssembly(AbstractAssembly):
                     if clk_hit:
                         if valid_smp:
                             packet.append(payload_smp)
-                        if len(packet) >= 512 or flush_smp:
+                            timer = 0
+                        if len(packet) >= 512 or flush_smp or timer >= 100:
                             i_buffer += packet
                             packet.clear()
+                        elif len(packet) > 0:
+                            timer += 1
             self._benches.append((i_testbench, True))
 
         if out_stream is None:
@@ -160,27 +190,11 @@ class SimulationAssembly(AbstractAssembly):
     def add_testbench(self, constructor, *, background=False):
         self._benches.append((constructor, background))
 
-    def use_voltage(self, ports: Mapping[GlasgowPort, GlasgowVio | float]):
-        for port, vio in ports.items():
-            port = GlasgowPort(port)
-            if isinstance(vio, float):
-                vio = GlasgowVio(vio)
-            pass # TODO: log?
+    def set_port_voltage(self, port: GlasgowPort, vio: GlasgowVio):
+        pass
 
-    def use_pulls(self, pulls: Mapping[GlasgowPin | tuple[GlasgowPin], PullState | str]):
-        for pins, state in pulls.items():
-            match pins:
-                case str():
-                    pins = GlasgowPin.parse(pins)
-                case GlasgowPin():
-                    pins = [pins]
-            match state:
-                case str():
-                    state = PullState(state)
-            for pin in pins:
-                if pin.invert:
-                    state = ~state
-                pass # TODO: record?
+    def set_pin_pull(self, pin: GlasgowPin, state: PullState):
+        pass # TODO: record pull state?
 
     async def configure_ports(self):
         pass # TODO: log and use pull state for default pin state?

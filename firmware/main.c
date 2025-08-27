@@ -93,7 +93,7 @@ usb_desc_endpoint_c usb_endpoint_6_in =
 usb_desc_endpoint_c usb_endpoint_8_in =
   USB_BULK_ENDPOINT(/*bEndpointAddress=*/8|USB_DIR_IN );
 
-usb_configuration_c usb_config_2_pipes = {
+usb_configuration_c usb_config_4_pipes = {
   {
     .bLength              = sizeof(struct usb_desc_configuration),
     .bDescriptorType      = USB_DESC_CONFIGURATION,
@@ -120,7 +120,7 @@ usb_configuration_c usb_config_2_pipes = {
   }
 };
 
-usb_configuration_c usb_config_1_pipe = {
+usb_configuration_c usb_config_2_pipes = {
   {
     .bLength              = sizeof(struct usb_desc_configuration),
     .bDescriptorType      = USB_DESC_CONFIGURATION,
@@ -147,8 +147,8 @@ __code const struct usb_configuration *__code const usb_configs[] = {
 #else
 usb_configuration_set_c usb_configs[] = {
 #endif
+  &usb_config_4_pipes,
   &usb_config_2_pipes,
-  &usb_config_1_pipe,
 };
 
 // This replaces the beginning of "Glasgow Interface Explorer" in the string table below if
@@ -359,7 +359,7 @@ void handle_usb_setup(__xdata struct usb_req_setup *req) {
   }
 }
 
-uint8_t usb_alt_setting[2];
+uint8_t usb_alt_setting[4];
 
 bool handle_usb_set_configuration(uint8_t config_value) {
   switch(config_value) {
@@ -372,6 +372,10 @@ bool handle_usb_set_configuration(uint8_t config_value) {
   usb_config_value = config_value;
   usb_alt_setting[0] = 0;
   usb_alt_setting[1] = 0;
+  usb_alt_setting[2] = 0;
+  usb_alt_setting[3] = 0;
+
+  fpga_pipe_rst(/*set=*/0xf, /*clr=*/0);
 
   usb_reset_data_toggles(&usb_descriptor_set, /*interface=*/0xff, /*alt_setting=*/0xff);
   return true;
@@ -436,7 +440,6 @@ void handle_pending_usb_setup() {
     uint8_t  arg_chip = 0;
     uint16_t arg_addr = req->wValue;
     uint16_t arg_len  = req->wLength;
-    uint8_t  page_size = 0;
     uint8_t  timeout   = 255; // 5 ms
     if(req->bRequest == USB_REQ_CYPRESS_EEPROM_DB) {
       arg_chip = I2C_ADDR_FX2_MEM;
@@ -444,16 +447,13 @@ void handle_pending_usb_setup() {
       switch(req->wIndex) {
         case 0:
           arg_chip  = I2C_ADDR_FX2_MEM;
-          page_size = 6; // 64 bytes
           break;
         case 1:
           arg_chip  = I2C_ADDR_ICE_MEM;
-          page_size = 8; // 256 bytes
           break;
         case 2:
           // Same chip, different I2C address for the top half.
           arg_chip  = I2C_ADDR_ICE_MEM + 1;
-          page_size = 8;
           break;
         case 3:
           // The HX8K bitstream is slightly (less than 4 KB) larger than the capacity of ICE_MEM,
@@ -461,7 +461,6 @@ void handle_pending_usb_setup() {
           // make sure the writes don't wrap, or we can overwrite the configuration info.
           if(arg_addr <= 0x1000 && arg_len <= 0x1000 && (arg_addr + arg_len) <= 0x1000) {
             arg_chip  = I2C_ADDR_FX2_MEM;
-            page_size = 6; // 64 bytes
             arg_addr += 0x7000;
           }
       }
@@ -484,6 +483,9 @@ void handle_pending_usb_setup() {
       } else {
         SETUP_EP0_BUF(0);
         while(EP0CS & _BUSY);
+        // Using a constant page size of 64 bytes because both the ICE and FX2 EEPROMs have a page
+        // size of >= 64 bytes, and USB2 control transfer packets are at most 64 bytes.
+        const uint8_t page_size = 6; // 64 bytes
         if(!eeprom_write(arg_chip, arg_addr, EP0BUF, chunk_len, /*double_byte=*/true,
                          page_size, timeout)) {
           goto stall_ep0_return;

@@ -59,6 +59,22 @@ jobs:
         if: matrix.dep-versions == 'minimal'
         working-directory: ./software
         run: git diff --exit-code pdm.min.lock
+      - name: Cache PDM package data
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pdm
+          key: PDM-${{ matrix.dep-versions }}-${{ hashFiles(matrix.dep-versions == 'minimal' && './software/pdm.min.lock' || './software/pdm.lock') }}
+          restore-keys: |
+            PDM-${{ matrix.dep-versions }}-
+            PDM-
+      - name: Cache virtual environment
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/pdm
+          key: venv-${{ runner.os }}-${{ matrix.python-version }}-${{ matrix.dep-versions }}-${{ hashFiles(matrix.dep-versions == 'minimal' && './software/pdm.min.lock' || './software/pdm.lock') }}
+          restore-keys: |
+            venv-${{ runner.os }}-${{ matrix.python-version }}-${{ matrix.dep-versions }}-
+            venv-${{ runner.os }}-${{ matrix.python-version }}-
       - name: Install dependencies
         working-directory: ./software
         run: pdm sync
@@ -76,7 +92,7 @@ jobs:
         run: |
           pdm run glasgow --help
           pdm run glasgow build --rev C3 uart
-          pdm run test
+          pdm run test --verbose
 
   build-firmware:
     runs-on: ubuntu-latest
@@ -145,6 +161,13 @@ jobs:
     steps:
       - name: Check out source code
         uses: actions/checkout@v4
+      - if: ${{ github.repository == 'GlasgowEmbedded/glasgow' && github.event.ref == 'refs/heads/main' }}
+        name: Inject wheel under latest/dist/
+        run: |
+          pip install build
+          python -m build --wheel software/
+          mkdir -p pages/latest/dist/
+          cp software/dist/*.whl pages/latest/dist/glasgow-0.1.dev0-py3-none-any.whl
       - if: ${{ github.repository == 'GlasgowEmbedded/glasgow' && github.event.ref == 'refs/heads/main' }}
         name: Inject documentation from artifact under latest/
         uses: actions/download-artifact@v4

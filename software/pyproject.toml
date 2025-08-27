@@ -18,7 +18,7 @@ classifiers = [
   "Topic :: System :: Hardware",
 ]
 
-requires-python = "~=3.11"
+requires-python = ">=3.11, <4"
 
 # Glasgow has only a few carefully chosen dependencies. The rationale for having them, as well as
 # the rationale for the particular version constraint, is explained below, and should be kept
@@ -31,7 +31,7 @@ dependencies = [
   # `typing_extensions` provides shims for such features. It uses SemVer.
   "typing_extensions>=4.8,<5",
   # Amaranth is the core of the Glasgow software/gateware interoperability layer. It uses SemVer.
-  "amaranth>=0.5.6,<0.6",
+  "amaranth>=0.5.7,<0.6",
   # `packaging` is used in the plugin system, `support.plugin`. It uses CalVer: the major version
   # is the two last digits of the year and the minor version is the release within that year.
   "packaging>=23.0",
@@ -44,13 +44,15 @@ dependencies = [
   # `libusb1` is used to communicate with the device, and its API mirrors the stable API/ABI of
   # of the native `libusb1` library. It increases major version when dropping support for older
   # Python versions.
-  "libusb1>=3.3.0",
+  "libusb1>=3.3.0; sys_platform!='emscripten'",
   # `cobs` is used to multiplex communication streams in applets. It uses an ad-hoc versioning
   # system.
   "cobs>=1.2.1",
   # `pyvcd` is used in the applet analyzer to dump waveform files. It is also a dependency of
   # Amaranth, and the version range here must be compatible with Amaranth's.
   "pyvcd>=0.4.1,<0.5",
+  # `importlib_resources` is used to shim over Python API incompatibilities. It uses SemVer.
+  "importlib_resources~=6.5.2",
 ]
 
 [project.optional-dependencies]
@@ -64,13 +66,13 @@ builtin-toolchain = [
   # the lowest that has features transitively required by Glasgow.
   "yowasp-runtime>=1.42",
   # Most versions of Yosys and nextpnr work; the minimum versions listed here are known good.
-  "yowasp-yosys>=0.31.0.13",
+  "yowasp-yosys>=0.31.0.13,!=0.54.*,!=0.55.*,!=0.56.*",
   "yowasp-nextpnr-ice40>=0.1",
 ]
 
 # The rest of the optional dependences belong to plugins (applets, loggers, etc.)
 http = [
-  "aiohttp>=3.9.0",
+  "aiohttp>=3.9.0,<3.12.0", # aiohttp 3.12.0 doesn't install on Python 3.11 for some reason
   "aiohttp-remotes>=1.2,<2",
 ]
 numpy = [
@@ -87,21 +89,24 @@ benchmark = "glasgow.applet.internal.benchmark:BenchmarkApplet"
 
 analyzer = "glasgow.applet.interface.analyzer:AnalyzerApplet"
 uart = "glasgow.applet.interface.uart:UARTApplet"
+uart-analyzer = "glasgow.applet.interface.uart_analyzer:UARTAnalyzerApplet"
 spi-analyzer = "glasgow.applet.interface.spi_analyzer:SPIAnalyzerApplet"
 spi-controller = "glasgow.applet.interface.spi_controller:SPIControllerApplet"
-spi-flashrom = "glasgow.applet.interface.spi_flashrom:SPIFlashromApplet"
-i2c-initiator = "glasgow.applet.interface.i2c_initiator:I2CInitiatorApplet"
+i2c-controller = "glasgow.applet.interface.i2c_controller:I2CControllerApplet"
 i2c-target = "glasgow.applet.interface.i2c_target:I2CTargetApplet"
 jtag-pinout = "glasgow.applet.interface.jtag_pinout:JTAGPinoutApplet"
 jtag-probe = "glasgow.applet.interface.jtag_probe:JTAGProbeApplet"
-jtag-openocd = "glasgow.applet.interface.jtag_openocd:JTAGOpenOCDApplet"
 jtag-svf = "glasgow.applet.interface.jtag_svf:JTAGSVFApplet"
-jtag-xvc = "glasgow.applet.interface.jtag_xvc:JTAGXVCApplet"
 ps2-host = "glasgow.applet.interface.ps2_host:PS2HostApplet"
 qspi-analyzer = "glasgow.applet.interface.qspi_analyzer:QSPIAnalyzerApplet"
 qspi-controller = "glasgow.applet.interface.qspi_controller:QSPIControllerApplet"
 sbw-probe = "glasgow.applet.interface.sbw_probe:SpyBiWireProbeApplet"
-swd-openocd = "glasgow.applet.interface.swd_openocd:SWDOpenOCDApplet"
+swd-probe = "glasgow.applet.interface.swd_probe:SWDProbeApplet"
+
+spi-flashrom = "glasgow.applet.bridge.spi_flashrom:SPIFlashromApplet"
+jtag-openocd = "glasgow.applet.bridge.jtag_openocd:JTAGOpenOCDApplet"
+jtag-xvc = "glasgow.applet.bridge.jtag_xvc:JTAGXVCApplet"
+probe-rs = "glasgow.applet.bridge.probe_rs:ProbeRsApplet"
 
 memory-24x = "glasgow.applet.memory._24x:Memory24xApplet"
 memory-25x = "glasgow.applet.memory._25x:Memory25xApplet"
@@ -126,6 +131,8 @@ program-xc9500 = "glasgow.applet.program.xc9500:ProgramXC9500Applet"
 program-xc9500xl = "glasgow.applet.program.xc9500xl:ProgramXC9500XLApplet"
 program-xpla3 = "glasgow.applet.program.xpla3:ProgramXPLA3Applet"
 
+control-gpio = "glasgow.applet.control.gpio:ControlGPIOApplet"
+control-mdio = "glasgow.applet.control.mdio:ControlMDIOApplet"
 control-servo = "glasgow.applet.control.servo:ControlServoApplet"
 control-si535x = "glasgow.applet.control.si535x:ControlSi535xApplet"
 control-tps6598x = "glasgow.applet.control.tps6598x:ControlTPS6598xApplet"

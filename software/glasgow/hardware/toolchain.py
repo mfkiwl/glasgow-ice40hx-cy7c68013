@@ -1,3 +1,4 @@
+from typing import Any, Optional, Iterator
 from abc import ABCMeta, abstractmethod
 import re
 import os
@@ -27,14 +28,24 @@ class Tool(metaclass=ABCMeta):
         self.name = str(name)
 
     @property
-    def env_var_name(self):
+    def package_name(self) -> str:
+        if self.name == "yosys" or self.name.startswith("nextpnr-"):
+            return self.name
+        if self.name == "icepack":
+            return "nextpnr-ice40"
+        if self.name == "ecppack":
+            return "nextpnr-ecp5"
+        raise NotImplementedError(f"package name for tool {self.name} is not known")
+
+    @property
+    def env_var_name(self) -> str:
         """Name of environment variable used by Amaranth to configure tool location."""
         # Identical to amaranth._toolchain.tool_env_var.
         return self.name.upper().replace("-", "_").replace("+", "X")
 
     @property
     @abstractmethod
-    def command(self):
+    def command(self) -> Optional[str]:
         """Command name for invoking the tool.
 
         Full path to the executable that can be used to run the tool, or ``None`` if the tool
@@ -44,7 +55,7 @@ class Tool(metaclass=ABCMeta):
 
     @property
     @abstractmethod
-    def available(self):
+    def available(self) -> bool:
         """Tool availability.
 
         ``True`` if the tool is installed, ``False`` otherwise. Installed binary may still not
@@ -54,7 +65,7 @@ class Tool(metaclass=ABCMeta):
 
     @property
     @abstractmethod
-    def version(self):
+    def version(self) -> Optional[tuple[str, ...]]:
         """Tool version number.
 
         ``None`` if version number could not be determined, or a tool-specific tuple if it could.
@@ -63,7 +74,7 @@ class Tool(metaclass=ABCMeta):
 
     @property
     @abstractmethod
-    def identifier(self):
+    def identifier(self) -> Optional[bytes]:
         """Unique tool identifier.
 
         Returns an array of 16 bytes that uniquely identifies the behavior of this particular tool
@@ -71,26 +82,19 @@ class Tool(metaclass=ABCMeta):
         its data files.
         """
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return f"<{self.__class__.__module__}.{self.__class__.__name__} {self.name}>"
-
 
 
 class WasmTool(Tool):
     PREFIX = "yowasp-"
 
     @property
-    def python_package(self):
-        if self.name == "yosys" or self.name.startswith("nextpnr-"):
-            return self.PREFIX + self.name
-        if self.name == "icepack":
-            return self.PREFIX + "nextpnr-ice40"
-        if self.name == "ecppack":
-            return self.PREFIX + "nextpnr-ecp5"
-        raise NotImplementedError(f"Python package for tool {self.name} is not known")
+    def python_package(self) -> str:
+        return self.PREFIX + self.package_name
 
     @property
-    def available(self):
+    def available(self) -> bool:
         try:
             importlib.metadata.metadata(self.python_package)
             return True
@@ -98,17 +102,27 @@ class WasmTool(Tool):
             return False
 
     @property
-    def command(self):
+    def command(self) -> Optional[str]:
         if self.available:
             basename = self.PREFIX + self.name
             # We cannot assume that the command is on PATH and accessible by its basename. This
             # will not be true when Glasgow is running from a pipx virtual environment (which isn't
             # activated when the `glasgow` script is run). Also, our build environment does not
             # even *have* PATH.
-            return os.path.join(sysconfig.get_path('scripts'), basename)
+            match os.name:
+                case "nt":
+                    schemes = ["nt_venv", "nt_user", "nt"]
+                case "posix":
+                    schemes = ["posix_venv", "posix_user", "posix_home", "posix_prefix"]
+            for scheme in schemes:
+                script_path  = os.path.join(sysconfig.get_path("scripts", scheme), basename)
+                script_path += sysconfig.get_config_var('EXE')
+                if os.path.exists(script_path):
+                    return script_path
+            raise FileNotFoundError(f"script {basename!r} not found; this is an issue with your installation")
 
     @property
-    def version(self):
+    def version(self) -> Optional[tuple[int, ...]]:
         if self.available:
             # Running Wasm tools for the first time can incur a significant delay, so use
             # the version from the Python package metadata (which is guaranteed to be the same).
@@ -116,7 +130,7 @@ class WasmTool(Tool):
             return (*importlib.metadata.version(self.python_package).split("."),)
 
     @property
-    def identifier(self):
+    def identifier(self) -> Optional[bytes]:
         if self.available:
             hasher = hashlib.blake2s()
             for file_entry in importlib.metadata.files(self.python_package):
@@ -128,22 +142,22 @@ class WasmTool(Tool):
 
 class SystemTool(Tool):
     @staticmethod
-    def get_output(args):
+    def get_output(args: list[str]) -> str:
         return subprocess.run(args,
             stdout=subprocess.PIPE,
             stderr=subprocess.STDOUT,
             encoding="utf-8").stdout.strip()
 
     @property
-    def available(self):
+    def available(self) -> bool:
         return self.command is not None
 
     @property
-    def command(self):
+    def command(self) -> Optional[str]:
         return shutil.which(os.environ.get(self.env_var_name, self.name))
 
     @property
-    def version(self):
+    def version(self) -> Optional[tuple[str, ...]]:
         if self.available:
             if self.name == "yosys":
                 # Yosys 0.26+50 (git sha1 ef8ed21a2, ccache clang 11.0.1-2 -O0 -fPIC)
@@ -196,7 +210,7 @@ class SystemTool(Tool):
 
     # To the Nix person who replaces this with something more sensible: please message @whitequark
     @property
-    def identifier(self):
+    def identifier(self) -> Optional[bytes]:
         if self.available:
             if self._identifier_cache is None:
                 hasher = hashlib.blake2s()
@@ -209,12 +223,46 @@ class SystemTool(Tool):
             return self._identifier_cache
 
 
+class JsTool(Tool):
+    @property
+    def _js_bridge(self) -> Any:
+        import js
+        return js.glasgowToolchain
+
+    @property
+    def available(self) -> bool:
+        return self._js_bridge.available(self.package_name)
+
+    @property
+    def command(self) -> Optional[str]:
+        if self.available:
+            return self.name
+
+    @property
+    def version(self) -> Optional[tuple[str, ...]]:
+        if self.available:
+            # Running Wasm tools can incur a significant delay; request the version from
+            # the toolchain bridge object.
+            return tuple(self._js_bridge.version(self.package_name).split("."))
+
+    @property
+    def identifier(self) -> Optional[bytes]:
+        if self.available:
+            # This implementation assumes that no two different tool builds will ever have the same
+            # version metadata. This is less robust than hashing every tool component, but it's not
+            # practical to do the latter on JS hosts.
+            hasher = hashlib.blake2s()
+            hasher.update(self.name.encode("utf-8"))
+            hasher.update(self._js_bridge.version(self.package_name).encode("utf-8"))
+            return hasher.digest()[:16]
+
+
 class Toolchain:
     def __init__(self, tools):
         self.tools = list(tools)
 
     @property
-    def available(self):
+    def available(self) -> bool:
         """Toolchain availability.
 
         ``True`` if every tool is available, ``False`` otherwise.
@@ -222,7 +270,7 @@ class Toolchain:
         return all(tool.available for tool in self.tools)
 
     @property
-    def missing(self):
+    def missing(self) -> Iterator[str]:
         """Tools that are missing from the toolchain.
 
         An iterator that yields the name of every tool whose version could not be determined,
@@ -231,7 +279,7 @@ class Toolchain:
         return (tool.name for tool in self.tools if not tool.available or tool.version is None)
 
     @property
-    def env_vars(self):
+    def env_vars(self) -> dict[str, str]:
         """Environment variables to bring the toolchain in scope.
 
         An environment dictionary that includes entries for every of the tools included in this
@@ -244,7 +292,7 @@ class Toolchain:
         return {tool.env_var_name: tool.command for tool in self.tools}
 
     @property
-    def versions(self):
+    def versions(self) -> dict[str, tuple[str, ...]]:
         """Versions of tools.
 
         A dictionary that maps names of tools to their versions.
@@ -252,7 +300,7 @@ class Toolchain:
         return {tool.name: tool.version for tool in self.tools}
 
     @property
-    def identifier(self):
+    def identifier(self) -> Optional[bytes]:
         """Unique toolchain identifier.
 
         Returns an array of 16 bytes that uniquely identifies this particular collection of tools,
@@ -265,11 +313,11 @@ class Toolchain:
             hasher.update(tool.identifier)
         return hasher.digest()[:16]
 
-    def __str__(self):
+    def __str__(self) -> str:
         return ", ".join(f"{name} {'.'.join(ver or ('(unavailable)',))}"
                          for name, ver in self.versions.items())
 
-    def __repr__(self):
+    def __repr__(self) -> str:
         return (f"<{self.__class__.__module__}.{self.__class__.__name__} " +
                 " ".join(f"{tool.command}=={'.'.join(tool.version or ('unavailable',))}"
                          for tool in self.tools) +
@@ -284,10 +332,12 @@ def find_toolchain(tools=("yosys", "nextpnr-ice40", "icepack"), *, quiet=False):
     toolchain isn't available within the constraints.
     """
     env_var_name = "GLASGOW_TOOLCHAIN"
-    available_toolchains = {
-        "builtin": Toolchain(map(WasmTool,   tools)),
-        "system":  Toolchain(map(SystemTool, tools)),
-    }
+    available_toolchains = {}
+    if sys.platform == "emscripten":
+        available_toolchains["js"]      = Toolchain(map(JsTool,     tools))
+    else:
+        available_toolchains["builtin"] = Toolchain(map(WasmTool,   tools))
+        available_toolchains["system"]  = Toolchain(map(SystemTool, tools))
 
     kinds = os.environ.get(env_var_name, ",".join(available_toolchains.keys())).split(",")
     for kind in kinds:

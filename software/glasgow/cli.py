@@ -15,15 +15,16 @@ from datetime import datetime
 
 from vcd import VCDWriter
 from amaranth import UnusedElaboratable
-from fx2 import FX2Config, FX2Device, FX2DeviceError, VID_CYPRESS, PID_FX2
+from fx2 import FX2Config, VID_CYPRESS, PID_FX2
 from fx2.format import input_data, diff_data
 
 from . import __version__
 from .support.logging import *
 from .support.asignal import *
 from .support.plugin import PluginRequirementsUnmet, PluginLoadError
+from .abstract import ClockingError
 from .hardware.device import GlasgowDeviceError, GlasgowDevice, GlasgowDeviceConfig
-from .hardware.device import VID_QIHW, PID_GLASGOW
+from .hardware.device import FX2BootloaderDevice, VID_QIHW, PID_GLASGOW
 from .hardware.toolchain import ToolchainNotFound
 from .hardware.build_plan import GatewareBuildError
 from .hardware.assembly import HardwareAssembly
@@ -44,7 +45,7 @@ class TextHelpFormatter(argparse.HelpFormatter):
         else:
             try:
                 columns, _ = os.get_terminal_size(sys.stderr.fileno())
-            except OSError:
+            except (OSError, AttributeError):
                 columns = 80
         super().__init__(prog, width=columns, max_help_position=28)
 
@@ -54,12 +55,16 @@ class TextHelpFormatter(argparse.HelpFormatter):
             if text.startswith("::"):
                 return text[2:]
 
-            list_match = re.match(r"(\s*)(\*.+)", text, flags=re.S)
-            if list_match:
-                text = re.sub(r"(\S)\s+(\S)", r"\1 \2", list_match[2])
-                text = textwrap.fill(text, width,
-                                     initial_indent=indent + "  ",
-                                     subsequent_indent=indent + "    ")
+            if text.startswith("*"):
+                items = re.findall(r"^\*(?:(?!^\*).)+", text, flags=re.S|re.M)
+                text = ""
+                for item in items:
+                    item = re.sub(r"(\S)\s+(\S)", r"\1 \2", item)
+                    item = textwrap.fill(item, width,
+                                         initial_indent=indent + "  ",
+                                         subsequent_indent=indent + "    ")
+                    text += item + "\n"
+                return text + "\n"
             else:
                 text = textwrap.fill(text, width,
                                      initial_indent=indent,
@@ -218,16 +223,14 @@ def get_argparser():
                     if mode in ("build", "interact", "repl", "script"):
                         access_args = GlasgowAppletArguments(applet_name=handle)
                         if mode in ("interact", "repl", "script"):
-                            g_applet_build = p_applet.add_argument_group("build arguments")
-                            applet_cls.add_build_arguments(g_applet_build, access_args)
+                            g_applet_config = p_applet.add_argument_group("configuration")
+                            applet_cls.add_build_arguments(g_applet_config, access_args)
                             if issubclass(applet_cls, GlasgowAppletV2):
-                                g_applet_setup = p_applet.add_argument_group("setup arguments")
-                                applet_cls.add_setup_arguments(g_applet_setup)
+                                applet_cls.add_setup_arguments(g_applet_config)
                                 if mode == "interact":
                                     applet_cls.add_run_arguments(p_applet)
                             else:
-                                g_applet_run = p_applet.add_argument_group("run arguments")
-                                applet_cls.add_run_arguments(g_applet_run, access_args)
+                                applet_cls.add_run_arguments(g_applet_config, access_args)
                                 if mode == "interact":
                                     applet_cls.add_interact_arguments(p_applet)
                             if mode == "repl":
@@ -354,7 +357,7 @@ def get_argparser():
         help="run an applet and execute a script against its programming interface")
     g_script_source = p_script.add_mutually_exclusive_group(required=True)
     g_script_source.add_argument(
-        "script_file", metavar="FILENAME", type=argparse.FileType("r"), nargs="?",
+        "script_file", metavar="FILENAME", type=argparse.FileType("r", encoding="utf-8"), nargs="?",
         help="run Python script FILENAME in the applet context")
     g_script_source.add_argument(
         "-c", metavar="COMMAND", dest="script_cmd", type=str,
@@ -466,6 +469,10 @@ def _applet(assembly, args):
                 applet.build(args)
                 return applet, None
             case GlasgowApplet():
+                logger.warning(
+                    "applet %r uses deprecated V1 API and should be migrated to V2 API; "
+                    "see https://github.com/GlasgowEmbedded/glasgow/issues/826 for details",
+                    args.applet)
                 target = DeprecatedTarget(assembly)
                 with assembly.add_applet(applet):
                     applet.build(target, args)
@@ -554,6 +561,8 @@ def configure_logger(args, term_handler):
         # more efficient.
         root_logger.setLevel(level)
 
+    return file_handler
+
 
 @contextlib.contextmanager
 def gc_freeze():
@@ -581,18 +590,19 @@ async def wait_for_sigint():
     raise SIGINTCaught
 
 
-async def main():
-    # Handle log messages emitted during construction of the argument parser (e.g. by the plugin
-    # subsystem).
-    term_handler = create_logger()
-
-    args = get_argparser().parse_args()
-    configure_logger(args, term_handler)
-
-    device = None
+async def main() -> int:
+    term_handler = file_handler = device = None
     try:
+        # Handle log messages emitted during construction of the argument parser (e.g. by
+        # the plugin subsystem).
+        term_handler = create_logger()
+        args = get_argparser().parse_args()
+        file_handler = configure_logger(args, term_handler)
+
+        logger.debug(version_info()) # print version info if verbose
+
         if args.action not in ("build", "test", "tool", "factory", "list"):
-            device = GlasgowDevice(args.serial)
+            device = await GlasgowDevice.find(args.serial)
             assembly = HardwareAssembly(device=device)
 
         if args.action == "voltage":
@@ -699,7 +709,7 @@ async def main():
 
                 except SystemExit as e:
                     return e.code
-                except GlasgowAppletError as e:
+                except (ClockingError, GlasgowAppletError) as e:
                     applet.logger.error(str(e))
                     return 1
                 except asyncio.CancelledError:
@@ -739,8 +749,10 @@ async def main():
                 applet_name, *applet_args = applet_cmdline
                 try:
                     applet_parser = argparse.ArgumentParser()
-                    def argparse_exit(self, status=0, message=None):
-                        if status: raise
+                    def argparse_exit(status=0, message=None):
+                        if message:
+                            logger.error(message.rstrip("\n"))
+                        exit(status)
                     applet_parser.exit = argparse_exit
 
                     applet_cls = GlasgowAppletMetadata.get(applet_name).load()
@@ -763,6 +775,9 @@ async def main():
                     logger.error("%s", exn)
                     return 1
 
+                except SystemExit:
+                    raise
+
                 except:
                     logger.error(f"error building applet #{len(applets) + 1} {applet_name!r}:")
                     raise
@@ -776,16 +791,17 @@ async def main():
                         raise
 
                 try:
-                    async def applet_task(applet, applet_parsed_args):
+                    async def applet_task(index, applet, applet_name, applet_parsed_args):
                         await applet.run(applet_parsed_args)
                         logger.info(f"applet #{index + 1} {applet_name!r} has finished running")
 
                     with gc_freeze():
                         async with asyncio.TaskGroup() as group:
                             applet_tasks = []
-                            for applet, applet_name, applet_parsed_args in applets:
+                            for index, (applet, applet_name, applet_parsed_args) in \
+                                    enumerate(applets):
                                 applet_tasks.append(group.create_task(
-                                    applet_task(applet, applet_parsed_args),
+                                    applet_task(index, applet, applet_name, applet_parsed_args),
                                     name=f"{applet_name}#{index + 1}"
                                 ))
 
@@ -800,7 +816,7 @@ async def main():
             tool = GlasgowAppletToolMetadata.get(args.tool).load()()
             try:
                 return await tool.run(args)
-            except GlasgowAppletError as e:
+            except (ClockingError, GlasgowAppletError) as e:
                 tool.logger.error(e)
                 return 1
 
@@ -842,11 +858,11 @@ async def main():
                     glasgow_config.bitstream_id   = new_bitstream_id
             elif args.applet:
                 logger.info("generating bitstream for applet %s", args.applet)
-                assembly = HardwareAssembly(revision=args.rev)
+                assembly = HardwareAssembly(revision=device.revision)
                 applet, _multiplexer = _applet(assembly, args)
                 plan = assembly.artifact()
                 new_bitstream_id = plan.bitstream_id
-                new_bitstream    = plan.get_bitstream()
+                new_bitstream    = await plan.get_bitstream()
 
                 # We always build and reflash the bitstream in case the one currently
                 # in EEPROM is corrupted. If we only compared the ID, there would be
@@ -924,7 +940,7 @@ async def main():
                 logger.info("generating bitstream for applet %r", args.applet)
                 with open(args.filename or args.applet + ".bin", "wb") as f:
                     f.write(plan.bitstream_id)
-                    f.write(plan.get_bitstream())
+                    f.write(await plan.get_bitstream())
 
         if args.action == "test":
             logger.info("testing applet %r", args.applet)
@@ -964,14 +980,12 @@ async def main():
                 vid, pid = VID_QIHW, PID_GLASGOW
             else:
                 vid, pid = VID_CYPRESS, PID_FX2
-            try:
-                fx2_device = FX2Device(vid, pid)
-            except FX2DeviceError:
-                logger.error(f"device {vid:#06x}:{pid:#06x} not found")
-                return 1
 
-            with importlib.resources.files("fx2").joinpath("boot-cypress.ihex").open("r") as f:
-                fx2_device.load_ram(input_data(f, fmt="ihex"))
+            # Errors finding the device are caught and logged below
+            device = await FX2BootloaderDevice.find(vid, pid)
+
+            logger.debug("loading bootloader from %r to device", str(FX2BootloaderDevice.firmware_file()))
+            await device.load_ram(FX2BootloaderDevice.firmware_data())
 
             fx2_config = FX2Config(vendor_id=VID_QIHW, product_id=PID_GLASGOW,
                                    device_id=device_id, i2c_400khz=True, disconnect=True)
@@ -981,17 +995,17 @@ async def main():
             image = fx2_config.encode()
 
             logger.info("programming device configuration and firmware")
-            fx2_device.write_boot_eeprom(0, image, addr_width=2, page_size=8)
+            await device.write_boot_eeprom(0, image)
 
             logger.info("verifying device configuration and firmware")
-            if fx2_device.read_boot_eeprom(0, len(image), addr_width=2) != image:
+            if await device.read_boot_eeprom(0, len(image)) != image:
                 logger.critical("factory programming failed")
                 return 1
 
             logger.warning("power cycle the device to finish the operation")
 
         if args.action == "list":
-            for serial in sorted(GlasgowDevice.enumerate_serials()):
+            for serial in sorted(await GlasgowDevice.enumerate()):
                 print(serial)
             return 0
 
@@ -1020,9 +1034,17 @@ async def main():
         logger.warning("interrupted")
         return 130 # 128 + SIGINT
 
+    except SystemExit as e:
+        return e.code
+
     finally:
+        root_logger = logging.getLogger()
+        root_logger.removeHandler(term_handler)
+        if file_handler is not None:
+            root_logger.removeHandler(file_handler)
+
         if device is not None:
-            device.close()
+            await device.close()
 
     return 0
 

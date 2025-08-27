@@ -5,11 +5,11 @@ import argparse
 from amaranth import *
 from amaranth.lib import enum, data, wiring, stream, io, cdc
 from amaranth.lib.wiring import In, Out
-from cobs.cobs import decode as cobs_decode
 
 from glasgow.support.logging import dump_hex
-from glasgow.gateware.stream import StreamFIFO
-from glasgow.gateware.cobs import Encoder as COBSEncoder
+from glasgow.gateware.stream import AsyncQueue
+from glasgow.gateware import cobs
+from glasgow.abstract import AbstractAssembly, GlasgowPin
 from glasgow.applet import GlasgowAppletError, GlasgowAppletV2
 
 
@@ -65,42 +65,42 @@ class QSPIAnalyzerFrontend(wiring.Component):
         m.domains.fifo = cd_fifo = ClockDomain(reset_less=True, local=True)
         m.d.comb += cd_fifo.clk.eq(sck_buffer.i)
 
-        m.submodules.fifo = fifo = StreamFIFO(
+        m.submodules.fifo = fifo = AsyncQueue(
             shape=self.stream.p.shape(),
             depth=4, # CDC only, no buffering
-            w_domain="fifo",
-            r_domain="sync"
+            i_domain="fifo",
+            o_domain="sync"
         )
 
         shreg = Signal(8)
         match len(io_buffer.i):
             case 4:
                 m.d.fifo += shreg.eq(Cat(io_buffer.i, shreg))
-                m.d.comb += fifo.w.p.data.eq(Cat(io_buffer.i, shreg))
+                m.d.comb += fifo.i.p.data.eq(Cat(io_buffer.i, shreg))
             case 2:
                 m.d.fifo += shreg.eq(Cat(io_buffer.i, C(0, 2), shreg))
-                m.d.comb += fifo.w.p.data.eq(Cat(io_buffer.i, C(0, 2), shreg))
+                m.d.comb += fifo.i.p.data.eq(Cat(io_buffer.i, C(0, 2), shreg))
 
         start = Signal(init=1)
         epoch = Signal(reset_less=True, init=1)
         count = Signal(range(2))
         with m.If(count == 1):
-            m.d.comb += fifo.w.valid.eq(1)
+            m.d.comb += fifo.i.valid.eq(1)
             with m.If(start):
                 m.d.qspi += start.eq(0)
                 m.d.qspi += epoch.eq(~epoch)
-                m.d.comb += fifo.w.p.epoch.eq(~epoch)
+                m.d.comb += fifo.i.p.epoch.eq(~epoch)
             with m.Else():
-                m.d.comb += fifo.w.p.epoch.eq(epoch)
+                m.d.comb += fifo.i.p.epoch.eq(epoch)
             m.d.qspi += count.eq(0)
         with m.Else():
             m.d.qspi += count.eq(count + 1)
 
         overflow_qspi  = Signal()
-        with m.If(fifo.w.valid & ~fifo.w.ready):
+        with m.If(fifo.i.valid & ~fifo.i.ready):
             m.d.qspi += overflow_qspi.eq(1)
 
-        wiring.connect(m, wiring.flipped(self.stream), fifo.r)
+        wiring.connect(m, wiring.flipped(self.stream), fifo.o)
 
         cs_sync = Signal()
         # Note that the async FIFO write-to-read latency, and the latency of this synchronizer,
@@ -109,7 +109,7 @@ class QSPIAnalyzerFrontend(wiring.Component):
         # indefinitely because there is no end marker. Back-to-back transfers may not ever cause
         # the `complete` output to be asserted.
         m.submodules.cs_sync = cdc.FFSynchronizer(cs_buffer.i, cs_sync)
-        with m.If(cs_sync & ~fifo.r.valid):
+        with m.If(cs_sync & ~fifo.o.valid):
             m.d.comb += self.complete.eq(1)
 
         overflow_sync = Signal()
@@ -122,7 +122,6 @@ class QSPIAnalyzerFrontend(wiring.Component):
 
 class QSPIAnalyzerComponent(wiring.Component):
     o_stream: Out(stream.Signature(8))
-    o_flush:  Out(1)
 
     overflow: Out(1)
 
@@ -135,14 +134,13 @@ class QSPIAnalyzerComponent(wiring.Component):
     def elaborate(self, platform):
         m = Module()
 
-        m.submodules.encoder = encoder = COBSEncoder(fifo_depth=self._buffer_size)
+        m.submodules.encoder = encoder = cobs.Encoder(fifo_depth=self._buffer_size)
         wiring.connect(m, wiring.flipped(self.o_stream), encoder.o)
 
         m.submodules.frontend = frontend = QSPIAnalyzerFrontend(self._ports)
 
         idle  = Signal(init=1)
         epoch = Signal()
-        timer = Signal(20)
         with m.If(frontend.stream.valid):
             with m.If(frontend.stream.p.epoch != epoch):
                 m.d.comb += encoder.i.p.end.eq(1)
@@ -156,9 +154,6 @@ class QSPIAnalyzerComponent(wiring.Component):
                 m.d.comb += frontend.stream.ready.eq(encoder.i.ready)
                 with m.If(encoder.i.ready):
                     m.d.sync += idle.eq(0)
-                    # FIXME: not the most elegant approach to make the timeout shorter
-                    # during simulation
-                    m.d.sync += timer.eq(1000 if platform is None else ~0)
         with m.Elif(frontend.complete & ~idle):
             m.d.comb += encoder.i.p.end.eq(1)
             m.d.comb += encoder.i.valid.eq(1)
@@ -166,51 +161,43 @@ class QSPIAnalyzerComponent(wiring.Component):
                 m.d.sync += idle.eq(1)
                 m.d.sync += epoch.eq(~epoch)
 
-        # FIXME: this timeout should be a part of the common FX2 logic
-        with m.Else():
-            with m.If(timer == 0):
-                m.d.comb += self.o_flush.eq(1)
-            with m.Else():
-                m.d.sync += timer.eq(timer - 1)
-
         m.d.comb += self.overflow.eq(frontend.overflow)
 
         return m
 
 
 class QSPIAnalyzerInterface:
-    def __init__(self, logger, assembly, *, cs, sck, io, buffer_size=512):
+    def __init__(self, logger: logging.Logger, assembly: AbstractAssembly, *,
+                 cs: GlasgowPin, sck: GlasgowPin, io: GlasgowPin, buffer_size=512):
         self._logger = logger
         self._level  = logging.DEBUG if self._logger.name == __name__ else logging.TRACE
 
         ports = assembly.add_port_group(cs=cs, sck=sck, io=io)
         component = assembly.add_submodule(QSPIAnalyzerComponent(ports, buffer_size))
-        # Use only a minimal interface FIFO; most of the buffering is done in the COBS encoder.
-        self._pipe = assembly.add_in_pipe(
-            component.o_stream, in_flush=component.o_flush, fifo_depth=4)
+        # Don't use an interface FIFO; the input buffering is done in the COBS encoder.
+        self._pipe = assembly.add_in_pipe(component.o_stream, fifo_depth=0)
         self._overflow = assembly.add_ro_register(component.overflow)
-
-        self._buffer  = bytearray()
-        self._packets = []
 
     def _log(self, message, *args):
         self._logger.log(self._level, "QSPI analyzer: " + message, *args)
 
-    async def _recv_packet(self) -> bytes:
-        while not self._packets:
-            if self._pipe.readable == 0 and await self._overflow:
-                raise QSPIAnalyzerOverflow("overflow")
+    async def capture(self) -> bytes:
+        """Capture a transaction.
 
-            self._buffer += await self._pipe.recv(self._pipe.readable or 1)
-            if b"\x00" in self._buffer:
-                *self._packets, self._buffer = self._buffer.split(b"\x00")
+        It is not possible to determine the mode of any given bus cycle, or the direction of any
+        given bit, so the transaction is captured as a byte sequence.
 
-        packet = self._packets[0]
-        del self._packets[0]
-        return cobs_decode(packet)
+        Raises
+        ------
+        QSPIAnalyzerOverflow
+            When the FPGA buffer overflows. The last few transactions before the overflow occurred
+            may be dropped as well.
+        """
 
-    async def capture(self) -> tuple[bytes, bytes]:
-        data = await self._recv_packet()
+        if await self._overflow:
+            raise QSPIAnalyzerOverflow("overflow")
+
+        data = cobs.decode((await self._pipe.recv_until(b"\0"))[:-1])
         self._log("capture data=<%s>", dump_hex(data))
         return data
 

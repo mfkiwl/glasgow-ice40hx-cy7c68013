@@ -5,9 +5,9 @@ import unittest
 import argparse
 import functools
 import asyncio
-import threading
 
 from ..support.plugin import PluginMetadata
+from ..support.asyncio import asyncio_run_in_thread
 from ..support.arepl import AsyncInteractiveConsole
 from ..support.mock import MockRecorder, MockReplayer
 from ..abstract import GlasgowVio, GlasgowPin, AbstractAssembly
@@ -77,15 +77,6 @@ class GlasgowAppletV2(metaclass=ABCMeta):
     def add_build_arguments(cls, parser, access):
         access.add_voltage_argument(parser)
 
-    def derive_clock(self, *args, clock_name=None, **kwargs):
-        try:
-            return ClockGen.derive(*args, **kwargs, logger=self.logger, clock_name=clock_name)
-        except ValueError as e:
-            if clock_name is None:
-                raise GlasgowAppletError(e)
-            else:
-                raise GlasgowAppletError(f"clock {clock_name}: {e}")
-
     @abstractmethod
     def build(self, args):
         self.assembly.use_voltage(args.voltage)
@@ -102,7 +93,7 @@ class GlasgowAppletV2(metaclass=ABCMeta):
         pass
 
     async def run(self, args):
-        raise GlasgowAppletError("This applet can only be used in REPL mode.")
+        raise GlasgowAppletError("this applet can only be used in REPL mode")
 
     @classmethod
     def add_repl_arguments(cls, parser):
@@ -176,8 +167,13 @@ class GlasgowAppletArguments:
             metavar = "PIN"
             if help is None:
                 help = f"bind the applet I/O line {name!r} to {metavar}"
+            help += f" ("
             if default:
-                help += f" (default: {default})"
+                help += f"default: '{default}', "
+            if required:
+                help += f"required)"
+            else:
+                help += f"optional)"
 
             def pin_arg(arg):
                 try:
@@ -217,10 +213,13 @@ class GlasgowAppletArguments:
             metavar = "PINS"
             if help is None:
                 help = f"bind the applet I/O lines {name!r} to {metavar}"
+            help += f" ("
             if default:
-                help += f" (default: {','.join(str(pin) for pin in default)})"
+                help += f"default: '{','.join(str(pin) for pin in default)}', "
+            if required:
+                help += f"required)"
             else:
-                help += " (default is empty)"
+                help += f"optional)"
 
             def pin_arg(arg):
                 try:
@@ -309,7 +308,7 @@ class GlasgowAppletV2TestCase(unittest.TestCase):
         assembly = HardwareAssembly(revision=revision or self.applet_cls.required_revision)
         applet = self.applet_cls(assembly)
         applet.build(parsed_args)
-        assembly.artifact().get_bitstream()
+        asyncio_run_in_thread(assembly.artifact().get_bitstream())
 
 
 def synthesis_test(case):
@@ -320,22 +319,7 @@ def synthesis_test(case):
 def async_test(case):
     @functools.wraps(case)
     def wrapper(*args, **kwargs):
-        thread_exn = None
-        def run_case():
-            nonlocal thread_exn
-            loop = asyncio.new_event_loop()
-            try:
-                loop.run_until_complete(case(*args, **kwargs))
-            except Exception as exn:
-                thread_exn = exn
-            finally:
-                loop.close()
-
-        thread = threading.Thread(target=run_case)
-        thread.start()
-        thread.join()
-        if thread_exn is not None:
-            raise thread_exn
+        asyncio_run_in_thread(case(*args, **kwargs))
     return wrapper
 
 
@@ -345,32 +329,30 @@ def applet_v2_simulation_test(*, prepare=None, args=None):
         def wrapper(self):
             parsed_args = self._parse_args(args)
             assembly = SimulationAssembly()
-            if prepare is not None:
-                prepare(self, assembly)
             applet: GlasgowAppletV2 = self.applet_cls(assembly)
             applet.build(parsed_args)
+            if prepare is not None:
+                prepare(self, assembly)
             async def launch(ctx):
                 await applet.setup(parsed_args)
                 await case(self, applet, ctx)
-            assembly.run(launch)
+            assembly.run(launch, vcd_file=f"{case.__name__}.vcd")
         return wrapper
     return decorator
 
 
-def applet_v2_hardware_test(*, prepare=None, args=None, mock):
+def applet_v2_hardware_test(*, prepare=None, args=None, mocks: list[str]):
     def decorator(case):
         @functools.wraps(case)
         @async_test
         async def wrapper(self):
-            *mock_path, mock_attr = mock.split(".")
             parsed_args = self._parse_args(args)
             fixture_path = os.path.join(
                 os.path.dirname(case.__code__.co_filename), "fixtures",
                 case.__name__ + ".json")
             if not os.path.exists(fixture_path):
                 # Record mode
-                device = GlasgowDevice()
-                assembly = HardwareAssembly(device=device)
+                assembly = HardwareAssembly.find_device()
                 applet: GlasgowAppletV2 = self.applet_cls(assembly)
                 applet.build(parsed_args)
                 async with assembly:
@@ -379,24 +361,29 @@ def applet_v2_hardware_test(*, prepare=None, args=None, mock):
                         await applet.setup(parsed_args)
                         if prepare is not None:
                             await prepare(self, assembly)
-                        mock_obj = applet
-                        for attr in mock_path:
-                            mock_obj = getattr(mock_obj, attr)
-                        setattr(mock_obj, mock_attr,
-                            MockRecorder(self, fixture, getattr(mock_obj, mock_attr)))
+                        for mock in mocks:
+                            mock_obj = applet
+                            *mock_path, mock_attr = mock.split(".")
+                            for attr in mock_path:
+                                mock_obj = getattr(mock_obj, attr)
+                            if getattr(mock_obj, mock_attr) is not None:
+                                setattr(mock_obj, mock_attr,
+                                    MockRecorder(self, fixture, mock, getattr(mock_obj, mock_attr)))
                         await case(self, applet)
                     os.rename(f"{fixture_path}.new", fixture_path)
-                device.close()
             else:
                 # Replay mode
                 assembly = HardwareAssembly(revision=self.applet_cls.required_revision)
                 applet: GlasgowAppletV2 = self.applet_cls(assembly)
                 applet.build(parsed_args)
                 with open(fixture_path, "r") as fixture:
-                    mock_obj = applet
-                    for attr in mock_path:
-                        mock_obj = getattr(mock_obj, attr)
-                    setattr(mock_obj, mock_attr, MockReplayer(self, fixture))
+                    for mock in mocks:
+                        mock_obj = applet
+                        *mock_path, mock_attr = mock.split(".")
+                        for attr in mock_path:
+                            mock_obj = getattr(mock_obj, attr)
+                        if getattr(mock_obj, mock_attr) is not None:
+                            setattr(mock_obj, mock_attr, MockReplayer(self, fixture, mock))
                     await case(self, applet)
         return wrapper
     return decorator
